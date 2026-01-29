@@ -4,6 +4,7 @@
 """CLI implementation of the prompt-tune subcommand."""
 
 import logging
+import uuid
 from pathlib import Path
 
 import graphrag.api as api
@@ -79,6 +80,10 @@ async def prompt_tune(
         redact(graph_config.model_dump()),
     )
 
+    # Generate session_id for tracing
+    session_id = str(uuid.uuid4())
+    logger.info("Prompt tuning session ID: %s", session_id)
+
     prompts = await api.generate_indexing_prompts(
         config=graph_config,
         limit=limit,
@@ -91,6 +96,7 @@ async def prompt_tune(
         n_subset_max=n_subset_max,
         k=k,
         verbose=verbose,
+        session_id=session_id,
     )
 
     output_path = output.resolve()
