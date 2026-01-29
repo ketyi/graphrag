@@ -32,6 +32,8 @@ async def build_index(
     is_update_run: bool = False,
     callbacks: list[WorkflowCallbacks] | None = None,
     additional_context: dict[str, Any] | None = None,
+    session_id: str | None = None,
+    user_id: str | None = None,
     verbose: bool = False,
     input_documents: pd.DataFrame | None = None,
 ) -> list[PipelineRunResult]:
@@ -49,6 +51,10 @@ async def build_index(
         A list of callbacks to register.
     additional_context : dict[str, Any] | None default=None
         Additional context to pass to the pipeline run. This can be accessed in the pipeline state under the 'additional_context' key.
+    session_id : str | None default=None
+        Session ID for Langfuse tracing. If provided, will be included in trace context.
+    user_id : str | None default=None
+        User ID for Langfuse tracing. If provided, will be included in trace context.
     input_documents : pd.DataFrame | None default=None.
         Override document loading and parsing and supply your own dataframe of documents to index.
 
@@ -72,6 +78,15 @@ async def build_index(
     pipeline = PipelineFactory.create_pipeline(config, method)
 
     workflow_callbacks.pipeline_start(pipeline.names())
+
+    # Merge session_id and user_id into additional_context if provided
+    if session_id is not None or user_id is not None:
+        if additional_context is None:
+            additional_context = {}
+        if session_id is not None:
+            additional_context["session_id"] = session_id
+        if user_id is not None:
+            additional_context["user_id"] = user_id
 
     async for output in run_pipeline(
         pipeline,

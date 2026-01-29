@@ -48,7 +48,25 @@ async def run_workflow(
 ) -> WorkflowFunctionOutput:
     """All the steps to transform community reports."""
     logger.info("Workflow started: create_community_reports")
-    edges = await load_table_from_storage("relationships", context.output_storage)
+    
+    # Get trace context for workflow-level span
+    workflow_span = None
+    try:
+        from graphrag.index.tracing import get_trace_context
+        trace_ctx = get_trace_context()
+        if trace_ctx and trace_ctx.should_trace:
+            workflow_span = trace_ctx.create_span(
+                name="workflow_create_community_reports",
+                metadata={
+                    "workflow": "create_community_reports",
+                    "claims_enabled": config.extract_claims.enabled,
+                },
+            )
+    except ImportError:
+        pass
+    
+    try:
+        edges = await load_table_from_storage("relationships", context.output_storage)
     entities = await load_table_from_storage("entities", context.output_storage)
     communities = await load_table_from_storage("communities", context.output_storage)
     claims = None
@@ -88,8 +106,18 @@ async def run_workflow(
     await write_table_to_storage(output, "community_reports", context.output_storage)
 
     logger.info("Workflow completed: create_community_reports")
-    return WorkflowFunctionOutput(result=output)
-
+    
+    if workflow_span:
+        workflow_span.end(
+            output={"community_reports_count": len(output)},
+        )
+    
+    return WorkflowFunctionOutput(result=output)    except Exception as e:
+        if workflow_span:
+            workflow_span.end(
+                output={\"error\": str(e), \"error_type\": type(e).__name__},
+            )
+        raise
 
 async def create_community_reports(
     edges_input: pd.DataFrame,

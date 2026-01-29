@@ -5,6 +5,7 @@
 
 import json
 import logging
+import random
 import re
 import time
 from collections.abc import AsyncIterable
@@ -108,6 +109,79 @@ async def _run_pipeline(
 
     last_workflow = "<startup>"
 
+    # Initialize Langfuse tracing if enabled
+    langfuse_client = None
+    root_span = None
+    
+    if config.langfuse.enabled:
+        try:
+            from langfuse import Langfuse
+
+            from graphrag.index.tracing import (
+                TraceContext,
+                set_langfuse_config,
+                set_trace_context,
+            )
+
+            # Apply pipeline-level sampling
+            should_trace = random.random() < config.langfuse.sample_rate
+
+            if should_trace:
+                # Initialize Langfuse client with fail-fast error handling
+                try:
+                    langfuse_client = Langfuse(
+                        public_key=config.langfuse.public_key,
+                        secret_key=config.langfuse.secret_key,
+                        host=config.langfuse.host,
+                        flush_at=config.langfuse.flush_at,
+                    )
+                except Exception as e:
+                    msg = f"Failed to initialize Langfuse client: {e}"
+                    logger.error(msg)
+                    raise ValueError(msg) from e
+
+                # Extract session_id and user_id from additional_context
+                additional_ctx = context.state.get("additional_context", {})
+                session_id = additional_ctx.get("session_id")
+                user_id = additional_ctx.get("user_id")
+
+                # Create trace
+                trace = langfuse_client.trace(
+                    name="graphrag_indexing_pipeline",
+                    session_id=session_id,
+                    user_id=user_id,
+                    metadata={
+                        "pipeline": pipeline.names(),
+                        "config_summary": {
+                            "concurrent_requests": config.concurrent_requests,
+                            "async_mode": config.async_mode.value if hasattr(config.async_mode, "value") else str(config.async_mode),
+                        },
+                    },
+                )
+
+                # Set trace context
+                trace_ctx = TraceContext(
+                    trace=trace,
+                    session_id=session_id,
+                    user_id=user_id,
+                    should_trace=True,
+                )
+                set_trace_context(trace_ctx)
+                set_langfuse_config(config.langfuse)
+
+                # Create root span for the entire pipeline
+                root_span = trace_ctx.create_span(
+                    name="pipeline_execution",
+                    metadata={"workflows": pipeline.names()},
+                )
+            else:
+                logger.info("Langfuse tracing is sampled out for this pipeline run (sample_rate=%.2f)", config.langfuse.sample_rate)
+
+        except ImportError as e:
+            msg = f"Langfuse is enabled but the langfuse package is not installed: {e}"
+            logger.error(msg)
+            raise ImportError(msg) from e
+
     try:
         await _dump_json(context)
 
@@ -130,11 +204,41 @@ async def _run_pipeline(
         logger.info("Indexing pipeline complete.")
         await _dump_json(context)
 
+        # End root span successfully
+        if root_span is not None:
+            root_span.end(
+                output={"status": "completed", "total_runtime": context.stats.total_runtime},
+            )
+
     except Exception as e:
         logger.exception("error running workflow %s", last_workflow)
+        
+        # End root span with error
+        if root_span is not None:
+            root_span.end(
+                output={"status": "error", "last_workflow": last_workflow},
+            )
+        
         yield PipelineRunResult(
             workflow=last_workflow, result=None, state=context.state, error=e
         )
+    finally:
+        # Flush Langfuse events
+        if langfuse_client is not None:
+            try:
+                langfuse_client.flush()
+                logger.info("Langfuse events flushed successfully.")
+            except Exception as e:
+                logger.warning("Failed to flush Langfuse events: %s", e)
+        
+        # Clean up trace context
+        if config.langfuse.enabled:
+            try:
+                from graphrag.index.tracing import set_langfuse_config, set_trace_context
+                set_trace_context(None)
+                set_langfuse_config(None)
+            except ImportError:
+                pass
 
 
 async def _dump_json(context: PipelineRunContext) -> None:

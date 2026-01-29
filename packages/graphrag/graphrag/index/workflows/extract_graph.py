@@ -35,7 +35,22 @@ async def run_workflow(
 ) -> WorkflowFunctionOutput:
     """All the steps to create the base entity graph."""
     logger.info("Workflow started: extract_graph")
-    text_units = await load_table_from_storage("text_units", context.output_storage)
+    
+    # Get trace context for workflow-level span
+    workflow_span = None
+    try:
+        from graphrag.index.tracing import get_trace_context
+        trace_ctx = get_trace_context()
+        if trace_ctx and trace_ctx.should_trace:
+            workflow_span = trace_ctx.create_span(
+                name="workflow_extract_graph",
+                metadata={"workflow": "extract_graph"},
+            )
+    except ImportError:
+        pass
+    
+    try:
+        text_units = await load_table_from_storage("text_units", context.output_storage)
 
     extraction_model_config = config.get_completion_model_config(
         config.extract_graph.completion_model_id
@@ -85,13 +100,26 @@ async def run_workflow(
         )
 
     logger.info("Workflow completed: extract_graph")
+    
+    if workflow_span:
+        workflow_span.end(
+            output={
+                "entities_count": len(entities),
+                "relationships_count": len(relationships),
+            },
+        )
+    
     return WorkflowFunctionOutput(
         result={
             "entities": entities,
             "relationships": relationships,
         }
-    )
-
+    )    except Exception as e:
+        if workflow_span:
+            workflow_span.end(
+                output={\"error\": str(e), \"error_type\": type(e).__name__},
+            )
+        raise
 
 async def extract_graph(
     text_units: pd.DataFrame,

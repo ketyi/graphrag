@@ -338,6 +338,18 @@ class VectorStoreDefaults:
 
 
 @dataclass
+class LangfuseDefaults:
+    """Default values for Langfuse tracing."""
+
+    enabled: bool = False
+    public_key: str | None = "${LANGFUSE_PUBLIC_KEY}"
+    secret_key: str | None = "${LANGFUSE_SECRET_KEY}"
+    host: str | None = "${LANGFUSE_HOST:https://cloud.langfuse.com}"
+    sample_rate: float = 1.0
+    flush_at: int = 15
+
+
+@dataclass
 class GraphRagConfigDefaults:
     """Default values for GraphRAG."""
 
@@ -347,6 +359,7 @@ class GraphRagConfigDefaults:
     concurrent_requests: int = 25
     async_mode: AsyncType = AsyncType.Threaded
     reporting: ReportingDefaults = field(default_factory=ReportingDefaults)
+    langfuse: LangfuseDefaults = field(default_factory=LangfuseDefaults)
     input_storage: InputStorageDefaults = field(default_factory=InputStorageDefaults)
     output_storage: OutputStorageDefaults = field(default_factory=OutputStorageDefaults)
     update_output_storage: UpdateOutputStorageDefaults = field(

@@ -83,43 +83,124 @@ class GraphExtractor:
         )
 
     async def _process_document(self, text: str, entity_types: list[str]) -> str:
-        messages_builder = CompletionMessagesBuilder().add_user_message(
-            self._extraction_prompt.format(**{
-                INPUT_TEXT_KEY: text,
-                ENTITY_TYPES_KEY: ",".join(entity_types),
-            })
-        )
+        """Process document and extract entities/relationships with Langfuse tracing."""
+        # Try to get trace context for gleaning span tracking
+        trace_ctx = None
+        extraction_span = None
+        try:
+            from graphrag.index.tracing import get_trace_context, set_explicit_tracing
+            trace_ctx = get_trace_context()
+            
+            if trace_ctx and trace_ctx.should_trace:
+                # Enable explicit tracing to prevent middleware from creating duplicate spans
+                set_explicit_tracing(True)
+                
+                extraction_span = trace_ctx.create_span(
+                    name="graph_extraction",
+                    input=text[:500] + "..." if len(text) > 500 else text,
+                    metadata={
+                        "entity_types": entity_types,
+                        "max_gleanings": self._max_gleanings,
+                        "text_length": len(text),
+                    },
+                )
+        except ImportError:
+            pass
 
-        response: LLMCompletionResponse = await self._model.completion_async(
-            messages=messages_builder.build(),
-        )  # type: ignore
-        results = response.content
-        messages_builder.add_assistant_message(results)
+        try:
+            messages_builder = CompletionMessagesBuilder().add_user_message(
+                self._extraction_prompt.format(**{
+                    INPUT_TEXT_KEY: text,
+                    ENTITY_TYPES_KEY: ",".join(entity_types),
+                })
+            )
 
-        # if gleanings are specified, enter a loop to extract more entities
-        # there are two exit criteria: (a) we hit the configured max, (b) the model says there are no more entities
-        if self._max_gleanings > 0:
-            for i in range(self._max_gleanings):
-                messages_builder.add_user_message(CONTINUE_PROMPT)
-                response: LLMCompletionResponse = await self._model.completion_async(
-                    messages=messages_builder.build(),
-                )  # type: ignore
-                response_text = response.content
-                messages_builder.add_assistant_message(response_text)
-                results += response_text
+            # Initial extraction (iteration 0)
+            if trace_ctx and trace_ctx.should_trace:
+                gen_span = trace_ctx.create_generation(
+                    name="entity_extraction_initial",
+                    input=messages_builder.build(),
+                    metadata={"iteration": 0, "type": "initial"},
+                )
+            
+            response: LLMCompletionResponse = await self._model.completion_async(
+                messages=messages_builder.build(),
+            )  # type: ignore
+            results = response.content
+            messages_builder.add_assistant_message(results)
 
-                # if this is the final glean, don't bother updating the continuation flag
-                if i >= self._max_gleanings - 1:
-                    break
+            if trace_ctx and trace_ctx.should_trace and gen_span:
+                gen_span.end(output=results)
 
-                messages_builder.add_user_message(LOOP_PROMPT)
-                response: LLMCompletionResponse = await self._model.completion_async(
-                    messages=messages_builder.build(),
-                )  # type: ignore
-                if response.content != "Y":
-                    break
+            # if gleanings are specified, enter a loop to extract more entities
+            # there are two exit criteria: (a) we hit the configured max, (b) the model says there are no more entities
+            if self._max_gleanings > 0:
+                for i in range(self._max_gleanings):
+                    # Ask for more entities
+                    messages_builder.add_user_message(CONTINUE_PROMPT)
+                    
+                    if trace_ctx and trace_ctx.should_trace:
+                        gleaning_span = trace_ctx.create_generation(
+                            name=f"entity_extraction_gleaning_{i+1}",
+                            input=messages_builder.build(),
+                            metadata={"iteration": i + 1, "type": "gleaning"},
+                        )
+                    
+                    response: LLMCompletionResponse = await self._model.completion_async(
+                        messages=messages_builder.build(),
+                    )  # type: ignore
+                    response_text = response.content
+                    messages_builder.add_assistant_message(response_text)
+                    results += response_text
 
-        return results
+                    if trace_ctx and trace_ctx.should_trace and gleaning_span:
+                        gleaning_span.end(output=response_text)
+
+                    # if this is the final glean, don't bother updating the continuation flag
+                    if i >= self._max_gleanings - 1:
+                        break
+
+                    # Check if should continue
+                    messages_builder.add_user_message(LOOP_PROMPT)
+                    
+                    if trace_ctx and trace_ctx.should_trace:
+                        check_span = trace_ctx.create_generation(
+                            name=f"entity_extraction_check_{i+1}",
+                            input=messages_builder.build(),
+                            metadata={"iteration": i + 1, "type": "continuation_check"},
+                        )
+                    
+                    response: LLMCompletionResponse = await self._model.completion_async(
+                        messages=messages_builder.build(),
+                    )  # type: ignore
+                    
+                    if trace_ctx and trace_ctx.should_trace and check_span:
+                        check_span.end(output=response.content)
+                    
+                    if response.content != "Y":
+                        break
+
+            if extraction_span:
+                extraction_span.end(
+                    output={"results_length": len(results)},
+                )
+            
+            return results
+            
+        except Exception as e:
+            if extraction_span:
+                extraction_span.end(
+                    output={"error": str(e), "error_type": type(e).__name__},
+                )
+            raise
+        finally:
+            # Always restore explicit tracing flag
+            if trace_ctx and trace_ctx.should_trace:
+                try:
+                    from graphrag.index.tracing import set_explicit_tracing
+                    set_explicit_tracing(False)
+                except ImportError:
+                    pass
 
     def _process_result(
         self,

@@ -42,7 +42,25 @@ async def run_workflow(
 ) -> WorkflowFunctionOutput:
     """All the steps to transform community reports."""
     logger.info("Workflow started: generate_text_embeddings")
-    embedded_fields = config.embed_text.names
+    
+    # Get trace context for workflow-level span
+    workflow_span = None
+    try:
+        from graphrag.index.tracing import get_trace_context
+        trace_ctx = get_trace_context()
+        if trace_ctx and trace_ctx.should_trace:
+            workflow_span = trace_ctx.create_span(
+                name="workflow_generate_text_embeddings",
+                metadata={
+                    "workflow": "generate_text_embeddings",
+                    "embedded_fields": config.embed_text.names,
+                },
+            )
+    except ImportError:
+        pass
+    
+    try:
+        embedded_fields = config.embed_text.names
     logger.info("Embedding the following fields: %s", embedded_fields)
     text_units = None
     entities = None
@@ -91,7 +109,19 @@ async def run_workflow(
             )
 
     logger.info("Workflow completed: generate_text_embeddings")
+    
+    if workflow_span:
+        workflow_span.end(
+            output={\"embeddings_generated\": list(output.keys())},
+        )
+    
     return WorkflowFunctionOutput(result=output)
+    except Exception as e:
+        if workflow_span:
+            workflow_span.end(
+                output={\"error\": str(e), \"error_type\": type(e).__name__},
+            )
+        raise
 
 
 async def generate_text_embeddings(

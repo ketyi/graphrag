@@ -27,6 +27,7 @@ from graphrag.config.models.extract_claims_config import ExtractClaimsConfig
 from graphrag.config.models.extract_graph_config import ExtractGraphConfig
 from graphrag.config.models.extract_graph_nlp_config import ExtractGraphNLPConfig
 from graphrag.config.models.global_search_config import GlobalSearchConfig
+from graphrag.config.models.langfuse_config import LangfuseConfig
 from graphrag.config.models.local_search_config import LocalSearchConfig
 from graphrag.config.models.prune_graph_config import PruneGraphConfig
 from graphrag.config.models.reporting_config import ReportingConfig
@@ -156,6 +157,11 @@ class GraphRagConfig(BaseModel):
                 msg = "Reporting base directory is required for file reporting. Please rerun `graphrag init` and set the reporting configuration."
                 raise ValueError(msg)
             self.reporting.base_dir = str(Path(self.reporting.base_dir).resolve())
+
+    langfuse: LangfuseConfig = Field(
+        description="The Langfuse tracing configuration.", default=LangfuseConfig()
+    )
+    """The Langfuse tracing configuration."""
 
     vector_store: VectorStoreConfig = Field(
         description="The vector store configuration.", default=VectorStoreConfig()
