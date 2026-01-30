@@ -29,13 +29,32 @@ async def generate_community_report_rating(
     -------
     - str: The generated rating description prompt response.
     """
+    from graphrag.index.tracing import get_trace_context
+    
     docs_str = " ".join(docs) if isinstance(docs, list) else docs
     domain_prompt = GENERATE_REPORT_RATING_PROMPT.format(
         domain=domain, persona=persona, input_text=docs_str
     )
 
+    trace_context = get_trace_context()
+    span = None
+    if trace_context:
+        span = trace_context.create_generation(
+            name="generate_community_report_rating",
+            input=domain_prompt,
+            metadata={
+                "domain": domain,
+                "persona": persona,
+                "docs_count": len(docs) if isinstance(docs, list) else 1,
+            },
+        )
+
     response: LLMCompletionResponse = await model.completion_async(
         messages=domain_prompt
     )  # type: ignore
+
+    if span:
+        span.update(output=response.content)
+        span.end()
 
     return response.content

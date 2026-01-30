@@ -24,11 +24,26 @@ async def generate_persona(
     - domain (str): The domain to generate a persona for
     - task (str): The task to generate a persona for. Default is DEFAULT_TASK
     """
+    from graphrag.index.tracing import get_trace_context
+    
     formatted_task = task.format(domain=domain)
     persona_prompt = GENERATE_PERSONA_PROMPT.format(sample_task=formatted_task)
+
+    trace_context = get_trace_context()
+    span = None
+    if trace_context:
+        span = trace_context.create_generation(
+            name="generate_persona",
+            input=persona_prompt,
+            metadata={"domain": domain, "task": formatted_task},
+        )
 
     response: LLMCompletionResponse = await model.completion_async(
         messages=persona_prompt
     )  # type: ignore
+
+    if span:
+        span.update(output=response.content)
+        span.end()
 
     return response.content

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from graphrag.index.tracing import get_trace_context
 from graphrag.index.typing.error_handler import ErrorHandlerFn
 
 if TYPE_CHECKING:
@@ -74,20 +75,39 @@ class CommunityReportsExtractor:
     async def __call__(self, input_text: str):
         """Call method definition."""
         output = None
+        trace_context = get_trace_context()
+        span = None
         try:
             prompt = self._extraction_prompt.format(**{
                 INPUT_TEXT_KEY: input_text,
                 MAX_LENGTH_KEY: str(self._max_report_length),
             })
+            
+            if trace_context and trace_context.should_trace:
+                span = trace_context.create_generation(
+                    name="community_reports_extraction",
+                    input=prompt,
+                    metadata={
+                        "input_text_length": len(input_text),
+                        "max_report_length": self._max_report_length,
+                    }
+                )
+            
             response = await self._model.completion_async(
                 messages=prompt,
                 response_format=CommunityReportResponse,  # A model is required when using json mode
             )
 
             output = response.formatted_response  # type: ignore
+            
+            if span:
+                span.update(output=output.model_dump() if output else None)
+                span.end()
         except Exception as e:
             logger.exception("error generating community report")
             self._on_error(e, traceback.format_exc(), None)
+            if span:
+                span.end()
 
         text_output = self._get_text_output(output) if output else ""
         return CommunityReportsResult(

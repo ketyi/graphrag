@@ -41,6 +41,8 @@ async def generate_entity_types(
     Example Output:
     "entity_types": ['military unit', 'organization', 'person', 'location', 'event', 'date', 'equipment']
     """
+    from graphrag.index.tracing import get_trace_context
+    
     formatted_task = task.format(domain=domain)
 
     docs_str = "\n".join(docs) if isinstance(docs, list) else docs
@@ -58,6 +60,20 @@ async def generate_entity_types(
         .build()
     )
 
+    trace_context = get_trace_context()
+    span = None
+    if trace_context:
+        span = trace_context.create_generation(
+            name="generate_entity_types",
+            input={"system": persona, "user": entity_types_prompt},
+            metadata={
+                "domain": domain,
+                "formatted_task": formatted_task,
+                "json_mode": json_mode,
+                "docs_count": len(docs) if isinstance(docs, list) else 1,
+            },
+        )
+
     if json_mode:
         response: LLMCompletionResponse[
             EntityTypesResponse
@@ -66,9 +82,20 @@ async def generate_entity_types(
             response_format=EntityTypesResponse,
         )  # type: ignore
         parsed_model = response.formatted_response
-        return parsed_model.entity_types if parsed_model else []
+        result = parsed_model.entity_types if parsed_model else []
+        
+        if span:
+            span.update(output=result)
+            span.end()
+        
+        return result
 
     non_json_response: LLMCompletionResponse = await model.completion_async(
         messages=messages
     )  # type: ignore
+    
+    if span:
+        span.update(output=non_json_response.content)
+        span.end()
+    
     return non_json_response.content

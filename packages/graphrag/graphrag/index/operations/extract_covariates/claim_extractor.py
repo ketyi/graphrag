@@ -13,6 +13,7 @@ from graphrag_llm.utils import (
 )
 
 from graphrag.config.defaults import graphrag_config_defaults
+from graphrag.index.tracing import get_trace_context
 from graphrag.index.typing.error_handler import ErrorHandlerFn
 from graphrag.prompts.index.extract_claims import (
     CONTINUE_PROMPT,
@@ -119,6 +120,8 @@ class ClaimExtractor:
     async def _process_document(
         self, text: str, claim_description: str, entity_spec: dict
     ) -> list[dict]:
+        trace_context = get_trace_context()
+        
         messages_builder = CompletionMessagesBuilder().add_user_message(
             self._extraction_prompt.format(**{
                 INPUT_TEXT_KEY: text,
@@ -127,10 +130,28 @@ class ClaimExtractor:
             })
         )
 
+        # Initial extraction
+        messages = messages_builder.build()
+        span = None
+        if trace_context and trace_context.should_trace:
+            span = trace_context.create_generation(
+                name="claim_extraction_initial",
+                input=messages,
+                metadata={
+                    "text_length": len(text),
+                    "claim_description": claim_description,
+                    "entity_spec": entity_spec,
+                }
+            )
+        
         response: LLMCompletionResponse = await self._model.completion_async(
-            messages=messages_builder.build(),
+            messages=messages,
         )  # type: ignore
         results = response.content
+        if span:
+            span.update(output=results)
+            span.end()
+        
         messages_builder.add_assistant_message(results)
         claims = results.strip().removesuffix(COMPLETION_DELIMITER)
 
@@ -139,10 +160,27 @@ class ClaimExtractor:
         if self._max_gleanings > 0:
             for i in range(self._max_gleanings):
                 messages_builder.add_user_message(CONTINUE_PROMPT)
+                messages = messages_builder.build()
+                
+                span = None
+                if trace_context and trace_context.should_trace:
+                    span = trace_context.create_generation(
+                        name=f"claim_extraction_gleaning_{i+1}",
+                        input=messages,
+                        metadata={
+                            "gleaning_iteration": i + 1,
+                            "max_gleanings": self._max_gleanings,
+                        }
+                    )
+                
                 response: LLMCompletionResponse = await self._model.completion_async(
-                    messages=messages_builder.build(),
+                    messages=messages,
                 )  # type: ignore
                 extension = response.content
+                if span:
+                    span.update(output=extension)
+                    span.end()
+                
                 messages_builder.add_assistant_message(extension)
                 claims += RECORD_DELIMITER + extension.strip().removesuffix(
                     COMPLETION_DELIMITER
@@ -153,9 +191,25 @@ class ClaimExtractor:
                     break
 
                 messages_builder.add_user_message(LOOP_PROMPT)
+                messages = messages_builder.build()
+                
+                span = None
+                if trace_context and trace_context.should_trace:
+                    span = trace_context.create_generation(
+                        name=f"claim_extraction_continue_check_{i+1}",
+                        input=messages,
+                        metadata={
+                            "gleaning_iteration": i + 1,
+                        }
+                    )
+                
                 response: LLMCompletionResponse = await self._model.completion_async(
-                    messages=messages_builder.build(),
+                    messages=messages,
                 )  # type: ignore
+                
+                if span:
+                    span.update(output=response.content)
+                    span.end()
 
                 if response.content != "Y":
                     break

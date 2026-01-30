@@ -36,6 +36,8 @@ async def generate_entity_relationship_examples(
     Will return entity/relationships examples as either JSON or in tuple_delimiter format depending
     on the json_mode parameter.
     """
+    from graphrag.index.tracing import get_trace_context
+    
     docs_list = [docs] if isinstance(docs, str) else docs
 
     msg_builder = CompletionMessagesBuilder().add_system_message(persona)
@@ -65,14 +67,34 @@ async def generate_entity_relationship_examples(
 
     messages = messages[:MAX_EXAMPLES]
 
-    tasks = [
-        model.completion_async(
+    trace_context = get_trace_context()
+    
+    async def _generate_with_tracing(message: str, index: int):
+        span = None
+        if trace_context:
+            span = trace_context.create_generation(
+                name=f"generate_entity_relationship_example_{index}",
+                input={"system": persona, "user": message},
+                metadata={
+                    "entity_types": entity_types_str if entity_types else None,
+                    "language": language,
+                    "json_mode": json_mode,
+                    "example_index": index,
+                },
+            )
+        
+        response: LLMCompletionResponse = await model.completion_async(
             messages=msg_builder.add_user_message(message).build(),
             response_format_json_object=json_mode,
-        )
-        for message in messages
-    ]
+        )  # type: ignore
+        
+        if span:
+            span.update(output=response.content)
+            span.end()
+        
+        return response
 
-    responses: list[LLMCompletionResponse] = await asyncio.gather(*tasks)  # type: ignore
+    tasks = [_generate_with_tracing(message, i) for i, message in enumerate(messages)]
+    responses: list[LLMCompletionResponse] = await asyncio.gather(*tasks)
 
     return [response.content for response in responses]

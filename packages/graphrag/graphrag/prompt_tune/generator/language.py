@@ -24,11 +24,26 @@ async def detect_language(model: "LLMCompletion", docs: str | list[str]) -> str:
     -------
     - str: The detected language.
     """
+    from graphrag.index.tracing import get_trace_context
+    
     docs_str = " ".join(docs) if isinstance(docs, list) else docs
     language_prompt = DETECT_LANGUAGE_PROMPT.format(input_text=docs_str)
+
+    trace_context = get_trace_context()
+    span = None
+    if trace_context:
+        span = trace_context.create_generation(
+            name="detect_language",
+            input=language_prompt,
+            metadata={"docs_count": len(docs) if isinstance(docs, list) else 1},
+        )
 
     response: LLMCompletionResponse = await model.completion_async(
         messages=language_prompt
     )  # type: ignore
+
+    if span:
+        span.update(output=response.content)
+        span.end()
 
     return response.content

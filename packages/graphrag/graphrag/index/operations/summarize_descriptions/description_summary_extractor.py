@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from graphrag.index.tracing import get_trace_context
 from graphrag.index.typing.error_handler import ErrorHandlerFn
 
 if TYPE_CHECKING:
@@ -121,14 +122,35 @@ class SummarizeExtractor:
         self, id: str | tuple[str, str] | list[str], descriptions: list[str]
     ):
         """Summarize descriptions using the LLM."""
+        trace_context = get_trace_context()
+        
+        prompt = self._summarization_prompt.format(**{
+            ENTITY_NAME_KEY: json.dumps(id, ensure_ascii=False),
+            DESCRIPTION_LIST_KEY: json.dumps(
+                sorted(descriptions), ensure_ascii=False
+            ),
+            MAX_LENGTH_KEY: self._max_summary_length,
+        })
+        
+        span = None
+        if trace_context and trace_context.should_trace:
+            span = trace_context.create_generation(
+                name="description_summarization",
+                input=prompt,
+                metadata={
+                    "entity_id": id,
+                    "description_count": len(descriptions),
+                    "max_summary_length": self._max_summary_length,
+                }
+            )
+        
         response: LLMCompletionResponse = await self._model.completion_async(
-            messages=self._summarization_prompt.format(**{
-                ENTITY_NAME_KEY: json.dumps(id, ensure_ascii=False),
-                DESCRIPTION_LIST_KEY: json.dumps(
-                    sorted(descriptions), ensure_ascii=False
-                ),
-                MAX_LENGTH_KEY: self._max_summary_length,
-            }),
+            messages=prompt,
         )  # type: ignore
+        
         # Calculate result
-        return response.content
+        result = response.content
+        if span:
+            span.update(output=result)
+            span.end()
+        return result
