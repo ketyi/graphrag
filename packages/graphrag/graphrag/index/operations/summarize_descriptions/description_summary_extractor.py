@@ -151,6 +151,18 @@ class SummarizeExtractor:
         # Calculate result
         result = response.content
         if span:
-            span.update(output=result)
+            usage_dict = None
+            usage = getattr(response, "usage", None)
+            if usage:
+                usage_dict = {
+                    "input": getattr(usage, "prompt_tokens", 0),
+                    "output": getattr(usage, "completion_tokens", 0),
+                    "total": getattr(usage, "total_tokens", 0),
+                }
+            span.update(
+                output=result,
+                usage_details=usage_dict,
+                model=getattr(response, "model", None),
+            )
             span.end()
         return result

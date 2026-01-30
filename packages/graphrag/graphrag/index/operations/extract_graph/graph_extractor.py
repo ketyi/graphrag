@@ -84,17 +84,14 @@ class GraphExtractor:
 
     async def _process_document(self, text: str, entity_types: list[str]) -> str:
         """Process document and extract entities/relationships with Langfuse tracing."""
-        # Try to get trace context for gleaning span tracking
+        # Try to get trace context for span tracking
         trace_ctx = None
         extraction_span = None
         try:
-            from graphrag.index.tracing import get_trace_context, set_explicit_tracing
+            from graphrag.index.tracing import get_trace_context
             trace_ctx = get_trace_context()
             
             if trace_ctx and trace_ctx.should_trace:
-                # Enable explicit tracing to prevent middleware from creating duplicate spans
-                set_explicit_tracing(True)
-                
                 extraction_span = trace_ctx.create_span(
                     name="graph_extraction",
                     input=text[:500] + "..." if len(text) > 500 else text,
@@ -116,6 +113,7 @@ class GraphExtractor:
             )
 
             # Initial extraction (iteration 0)
+            gen_span = None
             if trace_ctx and trace_ctx.should_trace:
                 gen_span = trace_ctx.create_generation(
                     name="entity_extraction_initial",
@@ -130,7 +128,20 @@ class GraphExtractor:
             messages_builder.add_assistant_message(results)
 
             if trace_ctx and trace_ctx.should_trace and gen_span:
-                gen_span.end(output=results)
+                usage_dict = None
+                usage = getattr(response, "usage", None)
+                if usage:
+                    usage_dict = {
+                        "input": getattr(usage, "prompt_tokens", 0),
+                        "output": getattr(usage, "completion_tokens", 0),
+                        "total": getattr(usage, "total_tokens", 0),
+                    }
+                gen_span.update(
+                    output=results,
+                    usage_details=usage_dict,
+                    model=getattr(response, "model", None),
+                )
+                gen_span.end()
 
             # if gleanings are specified, enter a loop to extract more entities
             # there are two exit criteria: (a) we hit the configured max, (b) the model says there are no more entities
@@ -139,6 +150,7 @@ class GraphExtractor:
                     # Ask for more entities
                     messages_builder.add_user_message(CONTINUE_PROMPT)
                     
+                    gleaning_span = None
                     if trace_ctx and trace_ctx.should_trace:
                         gleaning_span = trace_ctx.create_generation(
                             name=f"entity_extraction_gleaning_{i+1}",
@@ -154,7 +166,20 @@ class GraphExtractor:
                     results += response_text
 
                     if trace_ctx and trace_ctx.should_trace and gleaning_span:
-                        gleaning_span.end(output=response_text)
+                        usage_dict = None
+                        usage = getattr(response, "usage", None)
+                        if usage:
+                            usage_dict = {
+                                "input": getattr(usage, "prompt_tokens", 0),
+                                "output": getattr(usage, "completion_tokens", 0),
+                                "total": getattr(usage, "total_tokens", 0),
+                            }
+                        gleaning_span.update(
+                            output=response_text,
+                            usage_details=usage_dict,
+                            model=getattr(response, "model", None),
+                        )
+                        gleaning_span.end()
 
                     # if this is the final glean, don't bother updating the continuation flag
                     if i >= self._max_gleanings - 1:
@@ -163,6 +188,7 @@ class GraphExtractor:
                     # Check if should continue
                     messages_builder.add_user_message(LOOP_PROMPT)
                     
+                    check_span = None
                     if trace_ctx and trace_ctx.should_trace:
                         check_span = trace_ctx.create_generation(
                             name=f"entity_extraction_check_{i+1}",
@@ -175,32 +201,35 @@ class GraphExtractor:
                     )  # type: ignore
                     
                     if trace_ctx and trace_ctx.should_trace and check_span:
-                        check_span.end(output=response.content)
+                        usage_dict = None
+                        usage = getattr(response, "usage", None)
+                        if usage:
+                            usage_dict = {
+                                "input": getattr(usage, "prompt_tokens", 0),
+                                "output": getattr(usage, "completion_tokens", 0),
+                                "total": getattr(usage, "total_tokens", 0),
+                            }
+                        check_span.update(
+                            output=response.content,
+                            usage_details=usage_dict,
+                            model=getattr(response, "model", None),
+                        )
+                        check_span.end()
                     
                     if response.content != "Y":
                         break
-
-            if extraction_span:
-                extraction_span.end(
-                    output={"results_length": len(results)},
-                )
-            
-            return results
             
         except Exception as e:
             if extraction_span:
-                extraction_span.end(
-                    output={"error": str(e), "error_type": type(e).__name__},
-                )
+                extraction_span.update(output={"error": str(e), "error_type": type(e).__name__})
+                extraction_span.end()
             raise
-        finally:
-            # Always restore explicit tracing flag
-            if trace_ctx and trace_ctx.should_trace:
-                try:
-                    from graphrag.index.tracing import set_explicit_tracing
-                    set_explicit_tracing(False)
-                except ImportError:
-                    pass
+        else:
+            if extraction_span:
+                extraction_span.update(output={"results_length": len(results)})
+                extraction_span.end()
+            
+            return results
 
     def _process_result(
         self,

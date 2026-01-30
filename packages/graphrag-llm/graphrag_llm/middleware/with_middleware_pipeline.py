@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Literal
 
 from graphrag_llm.middleware.with_cache import with_cache
 from graphrag_llm.middleware.with_errors_for_testing import with_errors_for_testing
-from graphrag_llm.middleware.with_langfuse import with_langfuse
 from graphrag_llm.middleware.with_logging import with_logging
 from graphrag_llm.middleware.with_metrics import with_metrics
 from graphrag_llm.middleware.with_rate_limiting import with_rate_limiting
@@ -117,11 +116,8 @@ def with_middleware_pipeline(
             metrics_processor=metrics_processor,
         )
 
-    # Add Langfuse tracing middleware (always enabled, checks context internally)
-    model_fn, async_model_fn = with_langfuse(
-        sync_middleware=model_fn,
-        async_middleware=async_model_fn,
-    )
+    # Langfuse tracing is handled manually in extractors with explicit spans
+    # No middleware needed - all LLM calls are traced directly with usage tracking
 
     if rate_limiter:
         model_fn, async_model_fn = with_rate_limiting(

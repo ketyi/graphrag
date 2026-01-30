@@ -21,7 +21,6 @@ from pydantic import PositiveInt, validate_call
 
 from graphrag.config.models.graph_rag_config import GraphRagConfig
 from graphrag.index.tracing import (
-    set_explicit_tracing,
     set_trace_context,
 )
 from graphrag.logger.standard_logging import init_loggers
@@ -183,9 +182,6 @@ async def generate_indexing_prompts(
                 raise RuntimeError(msg) from e
 
     try:
-        # Set explicit tracing flag to prevent middleware duplication
-        set_explicit_tracing(True)
-
         # Retrieve documents
         logger.info("Chunking documents...")
         span = None
@@ -394,9 +390,6 @@ async def generate_indexing_prompts(
             community_summarization_prompt,
         )
     finally:
-        # Restore explicit tracing flag
-        set_explicit_tracing(False)
-
         # Exit the trace context if it was created
         if trace_context and trace_context.context_manager:
             with contextlib.suppress(Exception):

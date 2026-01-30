@@ -65,6 +65,7 @@ async def run_workflow(
     except ImportError:
         pass
     
+    output = pd.DataFrame()
     try:
         edges = await load_table_from_storage("relationships", context.output_storage)
         entities = await load_table_from_storage("entities", context.output_storage)
@@ -108,9 +109,10 @@ async def run_workflow(
         logger.info("Workflow completed: create_community_reports")
     finally:
         if workflow_span:
-            workflow_span.end(
-                output={"community_reports_count": len(output) if 'output' in locals() else 0},
+            workflow_span.update(
+                output={"community_reports_count": len(output)}
             )
+            workflow_span.end()
     
     return WorkflowFunctionOutput(result=output)
 

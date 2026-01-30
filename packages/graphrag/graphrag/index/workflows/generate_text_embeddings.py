@@ -59,6 +59,7 @@ async def run_workflow(
     except ImportError:
         pass
     
+    output: dict[str, pd.DataFrame] = {}
     try:
         embedded_fields = config.embed_text.names
         logger.info("Embedding the following fields: %s", embedded_fields)
@@ -111,9 +112,10 @@ async def run_workflow(
         logger.info("Workflow completed: generate_text_embeddings")
     finally:
         if workflow_span:
-            workflow_span.end(
-                output={"embeddings_generated": list(output.keys()) if 'output' in locals() else []},
+            workflow_span.update(
+                output={"embeddings_generated": list(output.keys())}
             )
+            workflow_span.end()
     
     return WorkflowFunctionOutput(result=output)
 
@@ -141,7 +143,7 @@ async def generate_text_embeddings(
         },
         entity_description_embedding: {
             "data": entities.loc[:, ["id", "title", "description"]].assign(
-                title_description=lambda df: df["title"] + ":" + df["description"]
+                title_description=lambda df: df["title"].astype(str) + ":" + df["description"].astype(str)
             )
             if entities is not None
             else None,

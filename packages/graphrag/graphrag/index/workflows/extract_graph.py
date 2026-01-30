@@ -49,6 +49,8 @@ async def run_workflow(
     except ImportError:
         pass
     
+    entities = pd.DataFrame()
+    relationships = pd.DataFrame()
     try:
         text_units = await load_table_from_storage("text_units", context.output_storage)
 
@@ -102,12 +104,13 @@ async def run_workflow(
         logger.info("Workflow completed: extract_graph")
     finally:
         if workflow_span:
-            workflow_span.end(
+            workflow_span.update(
                 output={
-                    "entities_count": len(entities) if 'entities' in locals() else 0,
-                    "relationships_count": len(relationships) if 'relationships' in locals() else 0,
-                },
+                    "entities_count": len(entities),
+                    "relationships_count": len(relationships),
+                }
             )
+            workflow_span.end()
     
     return WorkflowFunctionOutput(
         result={

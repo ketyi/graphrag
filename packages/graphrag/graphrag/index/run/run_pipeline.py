@@ -179,12 +179,23 @@ async def _run_pipeline(
                 )
                 trace = trace_ctx_mgr.__enter__()
                 
-                # Update trace-level attributes
-                if session_id or user_id:
-                    langfuse_client.update_current_trace(
-                        session_id=session_id,
-                        user_id=user_id,
-                    )
+                # Update trace-level attributes using BOTH methods to ensure name is set
+                # Method 1: Client-level update (sets trace name in current context)
+                langfuse_client.update_current_trace(
+                    name="graphrag_indexing_pipeline",
+                    session_id=session_id,
+                    user_id=user_id,
+                )
+                
+                # Method 2: Span-level update (backup in case client method fails)
+                trace.update_trace(
+                    name="graphrag_indexing_pipeline",
+                    session_id=session_id,
+                    user_id=user_id,
+                )
+                
+                # Flush to ensure trace name is visible immediately in Langfuse UI
+                langfuse_client.flush()
 
                 # Set trace context
                 trace_ctx = TraceContext(
@@ -234,18 +245,20 @@ async def _run_pipeline(
 
         # End root span successfully
         if root_span is not None:
-            root_span.end(
+            root_span.update(
                 output={"status": "completed", "total_runtime": context.stats.total_runtime},
             )
+            root_span.end()
 
     except Exception as e:
         logger.exception("error running workflow %s", last_workflow)
         
         # End root span with error
         if root_span is not None:
-            root_span.end(
+            root_span.update(
                 output={"status": "error", "last_workflow": last_workflow},
             )
+            root_span.end()
         
         yield PipelineRunResult(
             workflow=last_workflow, result=None, state=context.state, error=e

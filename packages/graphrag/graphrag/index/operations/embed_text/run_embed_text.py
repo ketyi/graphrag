@@ -79,14 +79,48 @@ async def _execute(
     tick: ProgressTicker,
     semaphore: asyncio.Semaphore,
 ) -> list[list[float]]:
-    async def embed(chunk: list[str]):
+    # Try to get trace context for tracking embeddings
+    trace_ctx = None
+    try:
+        from graphrag.index.tracing import get_trace_context
+        trace_ctx = get_trace_context()
+    except ImportError:
+        pass
+
+    async def embed(chunk: list[str], batch_index: int):
         async with semaphore:
+            # Create generation span for this embedding batch
+            span = None
+            if trace_ctx and trace_ctx.should_trace:
+                span = trace_ctx.create_generation(
+                    name=f"embedding_batch_{batch_index}",
+                    input={"texts_count": len(chunk), "sample": chunk[0][:200] if chunk else ""},
+                    metadata={"batch_index": batch_index, "batch_size": len(chunk)},
+                )
+
             embeddings_response = await model.embedding_async(input=chunk)
             result = np.array(embeddings_response.embeddings)
+
+            if span:
+                usage_dict = None
+                usage = getattr(embeddings_response, "usage", None)
+                if usage:
+                    usage_dict = {
+                        "input": getattr(usage, "prompt_tokens", 0),
+                        "output": 0,  # Embeddings don't have output tokens
+                        "total": getattr(usage, "total_tokens", 0),
+                    }
+                span.update(
+                    output={"embeddings_count": len(result)},
+                    usage_details=usage_dict,
+                    model=getattr(embeddings_response, "model", None),
+                )
+                span.end()
+
             tick(1)
         return result
 
-    futures = [embed(chunk) for chunk in chunks]
+    futures = [embed(chunk, i) for i, chunk in enumerate(chunks)]
     results = await asyncio.gather(*futures)
     # merge results in a single list of lists (reduce the collect dimension)
     return [item for sublist in results for item in sublist]

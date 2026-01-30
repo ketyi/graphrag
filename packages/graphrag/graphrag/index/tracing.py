@@ -24,11 +24,6 @@ _trace_context: contextvars.ContextVar[TraceContext | None] = contextvars.Contex
 _langfuse_config: contextvars.ContextVar[LangfuseConfig | None] = contextvars.ContextVar(
     "langfuse_config", default=None
 )
-# Flag to indicate when we're in an explicit tracing block (e.g., extractor with gleaning)
-# When True, middleware should skip automatic span creation to avoid duplicates
-_explicit_tracing: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "explicit_tracing", default=False
-)
 
 
 class TraceContext:
@@ -182,25 +177,3 @@ def set_langfuse_config(config: LangfuseConfig | None) -> None:
         The Langfuse configuration to set.
     """
     _langfuse_config.set(config)
-
-
-def is_explicit_tracing() -> bool:
-    """Check if we're currently in an explicit tracing block.
-
-    Returns
-    -------
-    bool
-        True if explicit tracing is active, False otherwise.
-    """
-    return _explicit_tracing.get()
-
-
-def set_explicit_tracing(enabled: bool) -> None:
-    """Set the explicit tracing flag.
-
-    Parameters
-    ----------
-    enabled : bool
-        Whether explicit tracing is enabled.
-    """
-    _explicit_tracing.set(enabled)

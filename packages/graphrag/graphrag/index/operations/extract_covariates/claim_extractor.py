@@ -149,7 +149,19 @@ class ClaimExtractor:
         )  # type: ignore
         results = response.content
         if span:
-            span.update(output=results)
+            usage_dict = None
+            usage = getattr(response, "usage", None)
+            if usage:
+                usage_dict = {
+                    "input": getattr(usage, "prompt_tokens", 0),
+                    "output": getattr(usage, "completion_tokens", 0),
+                    "total": getattr(usage, "total_tokens", 0),
+                }
+            span.update(
+                output=results,
+                usage_details=usage_dict,
+                model=getattr(response, "model", None),
+            )
             span.end()
         
         messages_builder.add_assistant_message(results)
@@ -178,7 +190,19 @@ class ClaimExtractor:
                 )  # type: ignore
                 extension = response.content
                 if span:
-                    span.update(output=extension)
+                    usage_dict = None
+                    usage = getattr(response, "usage", None)
+                    if usage:
+                        usage_dict = {
+                            "input": getattr(usage, "prompt_tokens", 0),
+                            "output": getattr(usage, "completion_tokens", 0),
+                            "total": getattr(usage, "total_tokens", 0),
+                        }
+                    span.update(
+                        output=extension,
+                        usage_details=usage_dict,
+                        model=getattr(response, "model", None),
+                    )
                     span.end()
                 
                 messages_builder.add_assistant_message(extension)
@@ -208,7 +232,19 @@ class ClaimExtractor:
                 )  # type: ignore
                 
                 if span:
-                    span.update(output=response.content)
+                    usage_dict = None
+                    usage = getattr(response, "usage", None)
+                    if usage:
+                        usage_dict = {
+                            "input": getattr(usage, "prompt_tokens", 0),
+                            "output": getattr(usage, "completion_tokens", 0),
+                            "total": getattr(usage, "total_tokens", 0),
+                        }
+                    span.update(
+                        output=response.content,
+                        usage_details=usage_dict,
+                        model=getattr(response, "model", None),
+                    )
                     span.end()
 
                 if response.content != "Y":
