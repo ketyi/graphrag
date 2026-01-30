@@ -61,67 +61,61 @@ async def run_workflow(
     
     try:
         embedded_fields = config.embed_text.names
-    logger.info("Embedding the following fields: %s", embedded_fields)
-    text_units = None
-    entities = None
-    community_reports = None
-    if text_unit_text_embedding in embedded_fields:
-        text_units = await load_table_from_storage("text_units", context.output_storage)
-    if entity_description_embedding in embedded_fields:
-        entities = await load_table_from_storage("entities", context.output_storage)
-    if community_full_content_embedding in embedded_fields:
-        community_reports = await load_table_from_storage(
-            "community_reports", context.output_storage
-        )
-
-    model_config = config.get_embedding_model_config(
-        config.embed_text.embedding_model_id
-    )
-
-    model = create_embedding(
-        model_config,
-        cache=context.cache.child(config.embed_text.model_instance_name),
-        cache_key_creator=cache_key_creator,
-    )
-
-    tokenizer = model.tokenizer
-
-    output = await generate_text_embeddings(
-        text_units=text_units,
-        entities=entities,
-        community_reports=community_reports,
-        callbacks=context.callbacks,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=config.embed_text.batch_size,
-        batch_max_tokens=config.embed_text.batch_max_tokens,
-        num_threads=config.concurrent_requests,
-        vector_store_config=config.vector_store,
-        embedded_fields=embedded_fields,
-    )
-
-    if config.snapshots.embeddings:
-        for name, table in output.items():
-            await write_table_to_storage(
-                table,
-                f"embeddings.{name}",
-                context.output_storage,
+        logger.info("Embedding the following fields: %s", embedded_fields)
+        text_units = None
+        entities = None
+        community_reports = None
+        if text_unit_text_embedding in embedded_fields:
+            text_units = await load_table_from_storage("text_units", context.output_storage)
+        if entity_description_embedding in embedded_fields:
+            entities = await load_table_from_storage("entities", context.output_storage)
+        if community_full_content_embedding in embedded_fields:
+            community_reports = await load_table_from_storage(
+                "community_reports", context.output_storage
             )
 
-    logger.info("Workflow completed: generate_text_embeddings")
-    
-    if workflow_span:
-        workflow_span.end(
-            output={\"embeddings_generated\": list(output.keys())},
+        model_config = config.get_embedding_model_config(
+            config.embed_text.embedding_model_id
         )
-    
-    return WorkflowFunctionOutput(result=output)
-    except Exception as e:
+
+        model = create_embedding(
+            model_config,
+            cache=context.cache.child(config.embed_text.model_instance_name),
+            cache_key_creator=cache_key_creator,
+        )
+
+        tokenizer = model.tokenizer
+
+        output = await generate_text_embeddings(
+            text_units=text_units,
+            entities=entities,
+            community_reports=community_reports,
+            callbacks=context.callbacks,
+            model=model,
+            tokenizer=tokenizer,
+            batch_size=config.embed_text.batch_size,
+            batch_max_tokens=config.embed_text.batch_max_tokens,
+            num_threads=config.concurrent_requests,
+            vector_store_config=config.vector_store,
+            embedded_fields=embedded_fields,
+        )
+
+        if config.snapshots.embeddings:
+            for name, table in output.items():
+                await write_table_to_storage(
+                    table,
+                    f"embeddings.{name}",
+                    context.output_storage,
+                )
+
+        logger.info("Workflow completed: generate_text_embeddings")
+    finally:
         if workflow_span:
             workflow_span.end(
-                output={\"error\": str(e), \"error_type\": type(e).__name__},
+                output={"embeddings_generated": list(output.keys()) if 'output' in locals() else []},
             )
-        raise
+    
+    return WorkflowFunctionOutput(result=output)
 
 
 async def generate_text_embeddings(

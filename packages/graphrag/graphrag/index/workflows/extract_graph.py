@@ -52,74 +52,70 @@ async def run_workflow(
     try:
         text_units = await load_table_from_storage("text_units", context.output_storage)
 
-    extraction_model_config = config.get_completion_model_config(
-        config.extract_graph.completion_model_id
-    )
-    extraction_prompts = config.extract_graph.resolved_prompts()
-    extraction_model = create_completion(
-        extraction_model_config,
-        cache=context.cache.child(config.extract_graph.model_instance_name),
-        cache_key_creator=cache_key_creator,
-    )
-
-    summarization_model_config = config.get_completion_model_config(
-        config.summarize_descriptions.completion_model_id
-    )
-    summarization_prompts = config.summarize_descriptions.resolved_prompts()
-    summarization_model = create_completion(
-        summarization_model_config,
-        cache=context.cache.child(config.summarize_descriptions.model_instance_name),
-        cache_key_creator=cache_key_creator,
-    )
-
-    entities, relationships, raw_entities, raw_relationships = await extract_graph(
-        text_units=text_units,
-        callbacks=context.callbacks,
-        extraction_model=extraction_model,
-        extraction_prompt=extraction_prompts.extraction_prompt,
-        entity_types=config.extract_graph.entity_types,
-        max_gleanings=config.extract_graph.max_gleanings,
-        extraction_num_threads=config.concurrent_requests,
-        extraction_async_type=config.async_mode,
-        summarization_model=summarization_model,
-        max_summary_length=config.summarize_descriptions.max_length,
-        max_input_tokens=config.summarize_descriptions.max_input_tokens,
-        summarization_prompt=summarization_prompts.summarize_prompt,
-        summarization_num_threads=config.concurrent_requests,
-    )
-
-    await write_table_to_storage(entities, "entities", context.output_storage)
-    await write_table_to_storage(relationships, "relationships", context.output_storage)
-
-    if config.snapshots.raw_graph:
-        await write_table_to_storage(
-            raw_entities, "raw_entities", context.output_storage
+        extraction_model_config = config.get_completion_model_config(
+            config.extract_graph.completion_model_id
         )
-        await write_table_to_storage(
-            raw_relationships, "raw_relationships", context.output_storage
+        extraction_prompts = config.extract_graph.resolved_prompts()
+        extraction_model = create_completion(
+            extraction_model_config,
+            cache=context.cache.child(config.extract_graph.model_instance_name),
+            cache_key_creator=cache_key_creator,
         )
 
-    logger.info("Workflow completed: extract_graph")
-    
-    if workflow_span:
-        workflow_span.end(
-            output={
-                "entities_count": len(entities),
-                "relationships_count": len(relationships),
-            },
+        summarization_model_config = config.get_completion_model_config(
+            config.summarize_descriptions.completion_model_id
         )
+        summarization_prompts = config.summarize_descriptions.resolved_prompts()
+        summarization_model = create_completion(
+            summarization_model_config,
+            cache=context.cache.child(config.summarize_descriptions.model_instance_name),
+            cache_key_creator=cache_key_creator,
+        )
+
+        entities, relationships, raw_entities, raw_relationships = await extract_graph(
+            text_units=text_units,
+            callbacks=context.callbacks,
+            extraction_model=extraction_model,
+            extraction_prompt=extraction_prompts.extraction_prompt,
+            entity_types=config.extract_graph.entity_types,
+            max_gleanings=config.extract_graph.max_gleanings,
+            extraction_num_threads=config.concurrent_requests,
+            extraction_async_type=config.async_mode,
+            summarization_model=summarization_model,
+            max_summary_length=config.summarize_descriptions.max_length,
+            max_input_tokens=config.summarize_descriptions.max_input_tokens,
+            summarization_prompt=summarization_prompts.summarize_prompt,
+            summarization_num_threads=config.concurrent_requests,
+        )
+
+        await write_table_to_storage(entities, "entities", context.output_storage)
+        await write_table_to_storage(relationships, "relationships", context.output_storage)
+
+        if config.snapshots.raw_graph:
+            await write_table_to_storage(
+                raw_entities, "raw_entities", context.output_storage
+            )
+            await write_table_to_storage(
+                raw_relationships, "raw_relationships", context.output_storage
+            )
+
+        logger.info("Workflow completed: extract_graph")
+    finally:
+        if workflow_span:
+            workflow_span.end(
+                output={
+                    "entities_count": len(entities) if 'entities' in locals() else 0,
+                    "relationships_count": len(relationships) if 'relationships' in locals() else 0,
+                },
+            )
     
     return WorkflowFunctionOutput(
         result={
             "entities": entities,
             "relationships": relationships,
         }
-    )    except Exception as e:
-        if workflow_span:
-            workflow_span.end(
-                output={\"error\": str(e), \"error_type\": type(e).__name__},
-            )
-        raise
+    )
+
 
 async def extract_graph(
     text_units: pd.DataFrame,

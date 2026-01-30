@@ -40,6 +40,7 @@ class TraceContext:
         session_id: str | None,
         user_id: str | None,
         should_trace: bool = True,
+        context_manager: Any | None = None,
     ):
         """Initialize trace context.
 
@@ -53,11 +54,14 @@ class TraceContext:
             The user ID for this trace.
         should_trace : bool
             Whether tracing is enabled for this execution (based on sampling).
+        context_manager : Any | None
+            The context manager object for proper cleanup.
         """
         self.trace = trace
         self.session_id = session_id
         self.user_id = user_id
         self.should_trace = should_trace
+        self.context_manager = context_manager
 
     def create_span(
         self,
@@ -87,7 +91,8 @@ class TraceContext:
         if not self.should_trace:
             return None
 
-        return self.trace.span(
+        # Langfuse 3.x: Use start_span() method on trace object
+        return self.trace.start_span(
             name=name,
             input=input,
             metadata=metadata,
@@ -125,7 +130,8 @@ class TraceContext:
         if not self.should_trace:
             return None
 
-        return self.trace.generation(
+        # Langfuse 3.x: Use start_generation() method on trace object
+        return self.trace.start_generation(
             name=name,
             input=input,
             metadata=metadata,

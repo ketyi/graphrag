@@ -3,10 +3,11 @@
 
 """Different methods to run the pipeline."""
 
+import contextlib
 import json
 import logging
-import random
 import re
+import secrets
 import time
 from collections.abc import AsyncIterable
 from dataclasses import asdict
@@ -112,6 +113,7 @@ async def _run_pipeline(
     # Initialize Langfuse tracing if enabled
     langfuse_client = None
     root_span = None
+    trace_ctx = None
     
     if config.langfuse.enabled:
         try:
@@ -124,20 +126,39 @@ async def _run_pipeline(
             )
 
             # Apply pipeline-level sampling
-            should_trace = random.random() < config.langfuse.sample_rate
+            should_trace = secrets.SystemRandom().random() < config.langfuse.sample_rate
 
             if should_trace:
                 # Initialize Langfuse client with fail-fast error handling
                 try:
+                    import os
+                    import re
+                    
+                    # Resolve environment variables in config values
+                    def resolve_env_var(value: str | None) -> str | None:
+                        """Resolve ${VAR} or ${VAR:default} patterns in config values."""
+                        if not value or not isinstance(value, str):
+                            return value
+                        
+                        # Match ${VAR} or ${VAR:default}
+                        pattern = r"\$\{([^:}]+)(?::([^}]*))?\}"
+                        
+                        def replacer(match):
+                            var_name = match.group(1)
+                            default_value = match.group(2) if match.group(2) is not None else ""
+                            return os.getenv(var_name, default_value)
+                        
+                        return re.sub(pattern, replacer, value)
+                    
                     langfuse_client = Langfuse(
-                        public_key=config.langfuse.public_key,
-                        secret_key=config.langfuse.secret_key,
-                        host=config.langfuse.host,
+                        public_key=resolve_env_var(config.langfuse.public_key),
+                        secret_key=resolve_env_var(config.langfuse.secret_key),
+                        host=resolve_env_var(config.langfuse.host),
                         flush_at=config.langfuse.flush_at,
                     )
                 except Exception as e:
                     msg = f"Failed to initialize Langfuse client: {e}"
-                    logger.error(msg)
+                    logger.exception(msg)
                     raise ValueError(msg) from e
 
                 # Extract session_id and user_id from additional_context
@@ -145,11 +166,9 @@ async def _run_pipeline(
                 session_id = additional_ctx.get("session_id")
                 user_id = additional_ctx.get("user_id")
 
-                # Create trace
-                trace = langfuse_client.trace(
+                # Create trace (Langfuse 3.x: use start_as_current_span and enter context)
+                trace_ctx_mgr = langfuse_client.start_as_current_span(
                     name="graphrag_indexing_pipeline",
-                    session_id=session_id,
-                    user_id=user_id,
                     metadata={
                         "pipeline": pipeline.names(),
                         "config_summary": {
@@ -158,6 +177,14 @@ async def _run_pipeline(
                         },
                     },
                 )
+                trace = trace_ctx_mgr.__enter__()
+                
+                # Update trace-level attributes
+                if session_id or user_id:
+                    langfuse_client.update_current_trace(
+                        session_id=session_id,
+                        user_id=user_id,
+                    )
 
                 # Set trace context
                 trace_ctx = TraceContext(
@@ -165,6 +192,7 @@ async def _run_pipeline(
                     session_id=session_id,
                     user_id=user_id,
                     should_trace=True,
+                    context_manager=trace_ctx_mgr,
                 )
                 set_trace_context(trace_ctx)
                 set_langfuse_config(config.langfuse)
@@ -179,7 +207,7 @@ async def _run_pipeline(
 
         except ImportError as e:
             msg = f"Langfuse is enabled but the langfuse package is not installed: {e}"
-            logger.error(msg)
+            logger.exception(msg)
             raise ImportError(msg) from e
 
     try:
@@ -223,18 +251,26 @@ async def _run_pipeline(
             workflow=last_workflow, result=None, state=context.state, error=e
         )
     finally:
+        # Exit the trace context if it was created
+        if trace_ctx and trace_ctx.context_manager:
+            with contextlib.suppress(Exception):
+                trace_ctx.context_manager.__exit__(None, None, None)
+
         # Flush Langfuse events
         if langfuse_client is not None:
             try:
                 langfuse_client.flush()
                 logger.info("Langfuse events flushed successfully.")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - intentionally catch all exceptions during cleanup
                 logger.warning("Failed to flush Langfuse events: %s", e)
         
         # Clean up trace context
         if config.langfuse.enabled:
             try:
-                from graphrag.index.tracing import set_langfuse_config, set_trace_context
+                from graphrag.index.tracing import (
+                    set_langfuse_config,
+                    set_trace_context,
+                )
                 set_trace_context(None)
                 set_langfuse_config(None)
             except ImportError:

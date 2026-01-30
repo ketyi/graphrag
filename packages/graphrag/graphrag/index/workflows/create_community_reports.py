@@ -67,57 +67,53 @@ async def run_workflow(
     
     try:
         edges = await load_table_from_storage("relationships", context.output_storage)
-    entities = await load_table_from_storage("entities", context.output_storage)
-    communities = await load_table_from_storage("communities", context.output_storage)
-    claims = None
-    if config.extract_claims.enabled and await storage_has_table(
-        "covariates", context.output_storage
-    ):
-        claims = await load_table_from_storage("covariates", context.output_storage)
+        entities = await load_table_from_storage("entities", context.output_storage)
+        communities = await load_table_from_storage("communities", context.output_storage)
+        claims = None
+        if config.extract_claims.enabled and await storage_has_table(
+            "covariates", context.output_storage
+        ):
+            claims = await load_table_from_storage("covariates", context.output_storage)
 
-    model_config = config.get_completion_model_config(
-        config.community_reports.completion_model_id
-    )
-    prompts = config.community_reports.resolved_prompts()
-
-    model = create_completion(
-        model_config,
-        cache=context.cache.child(config.community_reports.model_instance_name),
-        cache_key_creator=cache_key_creator,
-    )
-
-    tokenizer = model.tokenizer
-
-    output = await create_community_reports(
-        edges_input=edges,
-        entities=entities,
-        communities=communities,
-        claims_input=claims,
-        callbacks=context.callbacks,
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompts.graph_prompt,
-        max_input_length=config.community_reports.max_input_length,
-        max_report_length=config.community_reports.max_length,
-        num_threads=config.concurrent_requests,
-        async_type=config.async_mode,
-    )
-
-    await write_table_to_storage(output, "community_reports", context.output_storage)
-
-    logger.info("Workflow completed: create_community_reports")
-    
-    if workflow_span:
-        workflow_span.end(
-            output={"community_reports_count": len(output)},
+        model_config = config.get_completion_model_config(
+            config.community_reports.completion_model_id
         )
-    
-    return WorkflowFunctionOutput(result=output)    except Exception as e:
+        prompts = config.community_reports.resolved_prompts()
+
+        model = create_completion(
+            model_config,
+            cache=context.cache.child(config.community_reports.model_instance_name),
+            cache_key_creator=cache_key_creator,
+        )
+
+        tokenizer = model.tokenizer
+
+        output = await create_community_reports(
+            edges_input=edges,
+            entities=entities,
+            communities=communities,
+            claims_input=claims,
+            callbacks=context.callbacks,
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompts.graph_prompt,
+            max_input_length=config.community_reports.max_input_length,
+            max_report_length=config.community_reports.max_length,
+            num_threads=config.concurrent_requests,
+            async_type=config.async_mode,
+        )
+
+        await write_table_to_storage(output, "community_reports", context.output_storage)
+
+        logger.info("Workflow completed: create_community_reports")
+    finally:
         if workflow_span:
             workflow_span.end(
-                output={\"error\": str(e), \"error_type\": type(e).__name__},
+                output={"community_reports_count": len(output) if 'output' in locals() else 0},
             )
-        raise
+    
+    return WorkflowFunctionOutput(result=output)
+
 
 async def create_community_reports(
     edges_input: pd.DataFrame,

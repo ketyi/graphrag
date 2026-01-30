@@ -11,8 +11,9 @@ WARNING: This API is under development and may undergo changes in future release
 Backwards compatibility is not guaranteed at this time.
 """
 
+import contextlib
 import logging
-import random
+import secrets
 import uuid
 
 from graphrag_llm.completion import create_completion
@@ -100,17 +101,36 @@ async def generate_indexing_prompts(
     trace_context = None
     if config.langfuse.enabled:
         # Check sampling
-        if random.random() >= config.langfuse.sample_rate:
+        if secrets.SystemRandom().random() >= config.langfuse.sample_rate:
             logger.info("Skipping Langfuse tracing due to sampling rate.")
         else:
             try:
+                import os
+                import re
+
                 import langfuse  # type: ignore
 
-                # Initialize Langfuse client
+                # Resolve environment variables in config values
+                def resolve_env_var(value: str | None) -> str | None:
+                    """Resolve ${VAR} or ${VAR:default} patterns in config values."""
+                    if not value or not isinstance(value, str):
+                        return value
+                    
+                    # Match ${VAR} or ${VAR:default}
+                    pattern = r"\$\{([^:}]+)(?::([^}]*))?\}"
+                    
+                    def replacer(match):
+                        var_name = match.group(1)
+                        default_value = match.group(2) if match.group(2) is not None else ""
+                        return os.getenv(var_name, default_value)
+                    
+                    return re.sub(pattern, replacer, value)
+
+                # Initialize Langfuse client with resolved environment variables
                 langfuse_client = langfuse.Langfuse(
-                    public_key=config.langfuse.public_key,
-                    secret_key=config.langfuse.secret_key,
-                    host=config.langfuse.host,
+                    public_key=resolve_env_var(config.langfuse.public_key),
+                    secret_key=resolve_env_var(config.langfuse.secret_key),
+                    host=resolve_env_var(config.langfuse.host),
                 )
 
                 # Generate session_id if not provided
@@ -120,10 +140,9 @@ async def generate_indexing_prompts(
                 # Create root trace for prompt tuning
                 from graphrag.index.tracing import TraceContext
 
-                trace = langfuse_client.trace(  # type: ignore
+                # Langfuse 3.x: Use start_as_current_span to create and enter the trace context
+                trace_ctx_mgr = langfuse_client.start_as_current_span(  # type: ignore
                     name="prompt_tuning",
-                    session_id=session_id,
-                    user_id=user_id,
                     metadata={
                         "limit": limit,
                         "selection_method": selection_method.value,
@@ -133,11 +152,21 @@ async def generate_indexing_prompts(
                         "discover_entity_types": discover_entity_types,
                     },
                 )
+                trace = trace_ctx_mgr.__enter__()
+                
+                # Update trace-level attributes
+                if session_id or user_id:
+                    langfuse_client.update_current_trace(
+                        session_id=session_id,
+                        user_id=user_id,
+                    )
+                
                 trace_context = TraceContext(
                     trace=trace,
                     session_id=session_id,
                     user_id=user_id,
                     should_trace=True,
+                    context_manager=trace_ctx_mgr,
                 )
                 set_trace_context(trace_context)
                 logger.info("Initialized Langfuse tracing for prompt tuning.")
@@ -190,6 +219,7 @@ async def generate_indexing_prompts(
                 span = trace_context.create_generation(
                     name="generate_domain",
                     input={"docs_count": len(doc_list)},
+                    model=default_llm_settings.model,
                 )
             try:
                 domain = await generate_domain(llm, doc_list)
@@ -206,6 +236,7 @@ async def generate_indexing_prompts(
                 span = trace_context.create_generation(
                     name="detect_language",
                     input={"docs_count": len(doc_list)},
+                    model=default_llm_settings.model,
                 )
             try:
                 language = await detect_language(llm, doc_list)
@@ -221,6 +252,7 @@ async def generate_indexing_prompts(
             span = trace_context.create_generation(
                 name="generate_persona",
                 input={"domain": domain},
+                model=default_llm_settings.model,
             )
         try:
             persona = await generate_persona(llm, domain)
@@ -236,6 +268,7 @@ async def generate_indexing_prompts(
             span = trace_context.create_generation(
                 name="generate_community_report_rating",
                 input={"domain": domain, "persona": persona, "docs_count": len(doc_list)},
+                model=default_llm_settings.model,
             )
         try:
             community_report_ranking = await generate_community_report_rating(
@@ -263,6 +296,7 @@ async def generate_indexing_prompts(
                         "docs_count": len(doc_list),
                         "json_mode": True,
                     },
+                    model=default_llm_settings.model,
                 )
             try:
                 entity_types = await generate_entity_types(
@@ -290,6 +324,7 @@ async def generate_indexing_prompts(
                     "language": language,
                     "json_mode": False,
                 },
+                model=default_llm_settings.model,
             )
         try:
             examples = await generate_entity_relationship_examples(
@@ -361,6 +396,11 @@ async def generate_indexing_prompts(
     finally:
         # Restore explicit tracing flag
         set_explicit_tracing(False)
+
+        # Exit the trace context if it was created
+        if trace_context and trace_context.context_manager:
+            with contextlib.suppress(Exception):
+                trace_context.context_manager.__exit__(None, None, None)
 
         # Flush Langfuse traces
         if langfuse_client and config.langfuse.flush_at:
