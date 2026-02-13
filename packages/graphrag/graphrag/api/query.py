@@ -18,6 +18,7 @@ Backwards compatibility is not guaranteed at this time.
 """
 
 import logging
+import secrets
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -59,6 +60,124 @@ from graphrag.utils.cli import redact
 logger = logging.getLogger(__name__)
 
 
+def _init_langfuse_for_query(
+    config: GraphRagConfig,
+    trace_name: str,
+    query: str,
+    session_id: str | None = None,
+    user_id: str | None = None,
+):
+    """Initialize Langfuse tracing for a query operation.
+
+    Returns (langfuse_client, trace_ctx) or (None, None) if disabled/sampled-out.
+    """
+    if not config.langfuse.enabled:
+        return None, None
+
+    try:
+        from langfuse import Langfuse
+
+        from graphrag.index.tracing import (
+            TraceContext,
+            set_langfuse_config,
+            set_trace_context,
+        )
+    except ImportError:
+        logger.warning("Langfuse is enabled but the langfuse package is not installed.")
+        return None, None
+
+    # Apply sampling
+    should_trace = secrets.SystemRandom().random() < config.langfuse.sample_rate
+    if not should_trace:
+        logger.info(
+            "Langfuse tracing is sampled out for this query (sample_rate=%.2f)",
+            config.langfuse.sample_rate,
+        )
+        return None, None
+
+    try:
+        import os
+        import re
+
+        def resolve_env_var(value: str | None) -> str | None:
+            """Resolve ${VAR} or ${VAR:default} patterns in config values."""
+            if not value or not isinstance(value, str):
+                return value
+            pattern = r"\$\{([^:}]+)(?::([^}]*))?\}"
+            def replacer(match):
+                var_name = match.group(1)
+                default_value = match.group(2) if match.group(2) is not None else ""
+                return os.getenv(var_name, default_value)
+            return re.sub(pattern, replacer, value)
+
+        langfuse_client = Langfuse(
+            public_key=resolve_env_var(config.langfuse.public_key),
+            secret_key=resolve_env_var(config.langfuse.secret_key),
+            host=resolve_env_var(config.langfuse.host),
+            flush_at=config.langfuse.flush_at,
+        )
+    except Exception as e:
+        logger.warning("Failed to initialize Langfuse client for query: %s", e)
+        return None, None
+
+    try:
+        trace_ctx_mgr = langfuse_client.start_as_current_span(
+            name=trace_name,
+            metadata={"query": query},
+        )
+        trace = trace_ctx_mgr.__enter__()
+
+        langfuse_client.update_current_trace(
+            name=trace_name,
+            session_id=session_id,
+            user_id=user_id,
+        )
+        trace.update_trace(
+            name=trace_name,
+            session_id=session_id,
+            user_id=user_id,
+        )
+        langfuse_client.flush()
+
+        trace_ctx = TraceContext(
+            trace=trace,
+            session_id=session_id,
+            user_id=user_id,
+            should_trace=True,
+            context_manager=trace_ctx_mgr,
+            langfuse_client=langfuse_client,
+        )
+        set_trace_context(trace_ctx)
+        set_langfuse_config(config.langfuse)
+
+        return langfuse_client, trace_ctx
+    except Exception as e:
+        logger.warning("Failed to create Langfuse trace for query: %s", e)
+        return None, None
+
+
+def _cleanup_langfuse_for_query(langfuse_client, trace_ctx):
+    """Flush and clean up Langfuse tracing after a query."""
+    if trace_ctx and trace_ctx.context_manager:
+        import contextlib
+        with contextlib.suppress(Exception):
+            trace_ctx.context_manager.__exit__(None, None, None)
+
+    if langfuse_client is not None:
+        try:
+            langfuse_client.flush()
+            logger.info("Langfuse query events flushed successfully.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to flush Langfuse query events: %s", e)
+
+    try:
+        from graphrag.index.tracing import set_langfuse_config, set_trace_context
+        set_trace_context(None)
+        set_langfuse_config(None)
+    except ImportError:
+        pass
+
+
 @validate_call(config={"arbitrary_types_allowed": True})
 async def global_search(
     config: GraphRagConfig,
@@ -71,6 +190,8 @@ async def global_search(
     query: str,
     callbacks: list[QueryCallbacks] | None = None,
     verbose: bool = False,
+    session_id: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[
     str | dict[str, Any] | list[dict[str, Any]],
     str | list[pd.DataFrame] | dict[str, pd.DataFrame],
@@ -87,12 +208,29 @@ async def global_search(
     - dynamic_community_selection (bool): Enable dynamic community selection instead of using all community reports at a fixed level. Note that you can still provide community_level cap the maximum level to search.
     - response_type (str): The type of response to return.
     - query (str): The user query to search for.
+    - session_id (str | None): Optional session ID for Langfuse tracing.
+    - user_id (str | None): Optional user ID for Langfuse tracing.
 
     Returns
     -------
     TODO: Document the search response type and format.
     """
     init_loggers(config=config, verbose=verbose, filename="query.log")
+
+    # Initialize Langfuse tracing
+    langfuse_client, trace_ctx = _init_langfuse_for_query(
+        config=config,
+        trace_name="graphrag_global_search",
+        query=query,
+        session_id=session_id,
+        user_id=user_id,
+    )
+    root_span = None
+    if trace_ctx and trace_ctx.should_trace:
+        root_span = trace_ctx.create_span(
+            name="global_search_execution",
+            input={"query": query, "response_type": response_type, "dynamic_community_selection": dynamic_community_selection},
+        )
 
     callbacks = callbacks or []
     full_response = ""
@@ -106,25 +244,38 @@ async def global_search(
     local_callbacks.on_context = on_context
     callbacks.append(local_callbacks)
 
-    logger.debug("Executing global search query: %s", query)
-    async for chunk in global_search_streaming(
-        config=config,
-        entities=entities,
-        communities=communities,
-        community_reports=community_reports,
-        community_level=community_level,
-        dynamic_community_selection=dynamic_community_selection,
-        response_type=response_type,
-        query=query,
-        callbacks=callbacks,
-    ):
-        full_response += chunk
-    logger.debug("Query response: %s", truncate(full_response, 400))
+    try:
+        logger.debug("Executing global search query: %s", query)
+        async for chunk in global_search_streaming(
+            config=config,
+            entities=entities,
+            communities=communities,
+            community_reports=community_reports,
+            community_level=community_level,
+            dynamic_community_selection=dynamic_community_selection,
+            response_type=response_type,
+            query=query,
+            callbacks=callbacks,
+        ):
+            full_response += chunk
+        logger.debug("Query response: %s", truncate(full_response, 400))
+
+        if root_span is not None:
+            root_span.update(output={"response_length": len(full_response), "status": "completed"})
+            root_span.end()
+    except Exception:
+        if root_span is not None:
+            root_span.update(output={"status": "error"})
+            root_span.end()
+        raise
+    finally:
+        _cleanup_langfuse_for_query(langfuse_client, trace_ctx)
+
     return full_response, context_data
 
 
 @validate_call(config={"arbitrary_types_allowed": True})
-def global_search_streaming(
+async def global_search_streaming(
     config: GraphRagConfig,
     entities: pd.DataFrame,
     communities: pd.DataFrame,
@@ -135,6 +286,8 @@ def global_search_streaming(
     query: str,
     callbacks: list[QueryCallbacks] | None = None,
     verbose: bool = False,
+    session_id: str | None = None,
+    user_id: str | None = None,
 ) -> AsyncGenerator:
     """Perform a global search and return the context data and response via a generator.
 
@@ -150,12 +303,31 @@ def global_search_streaming(
     - dynamic_community_selection (bool): Enable dynamic community selection instead of using all community reports at a fixed level. Note that you can still provide community_level cap the maximum level to search.
     - response_type (str): The type of response to return.
     - query (str): The user query to search for.
+    - session_id (str | None): Optional session ID for Langfuse tracing.
+    - user_id (str | None): Optional user ID for Langfuse tracing.
 
     Returns
     -------
     TODO: Document the search response type and format.
     """
     init_loggers(config=config, verbose=verbose, filename="query.log")
+
+    # Initialize Langfuse tracing if not already set up by global_search()
+    from graphrag.index.tracing import get_trace_context
+
+    existing_trace = get_trace_context()
+    langfuse_client = None
+    trace_ctx = None
+
+    if existing_trace is None:
+        # Standalone streaming call — set up Langfuse lifecycle here
+        langfuse_client, trace_ctx = _init_langfuse_for_query(
+            config=config,
+            trace_name="graphrag_global_search_streaming",
+            query=query,
+            session_id=session_id,
+            user_id=user_id,
+        )
 
     communities_ = read_indexer_communities(communities, community_reports)
     reports = read_indexer_reports(
@@ -184,7 +356,14 @@ def global_search_streaming(
         general_knowledge_inclusion_prompt=knowledge_prompt,
         callbacks=callbacks,
     )
-    return search_engine.stream_search(query=query)
+
+    try:
+        async for chunk in search_engine.stream_search(query=query):
+            yield chunk
+    finally:
+        # Only clean up if we created the Langfuse context here
+        if langfuse_client is not None:
+            _cleanup_langfuse_for_query(langfuse_client, trace_ctx)
 
 
 @validate_call(config={"arbitrary_types_allowed": True})

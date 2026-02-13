@@ -65,3 +65,11 @@ class GlobalSearchConfig(BaseModel):
         description="The maximum level of community hierarchy to consider if none of the processed communities are relevant",
         default=graphrag_config_defaults.global_search.dynamic_search_max_level,
     )
+    dynamic_search_timeout_sec: int = Field(
+        description="Maximum time in seconds for dynamic community selection. Partial results are used if timeout is reached. 0 means no timeout.",
+        default=graphrag_config_defaults.global_search.dynamic_search_timeout_sec,
+    )
+    map_timeout_sec: int = Field(
+        description="Maximum time in seconds for the map phase. Partial results are used if timeout is reached. 0 means no timeout.",
+        default=graphrag_config_defaults.global_search.map_timeout_sec,
+    )

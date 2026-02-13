@@ -36,6 +36,7 @@ class TraceContext:
         user_id: str | None,
         should_trace: bool = True,
         context_manager: Any | None = None,
+        langfuse_client: Any | None = None,
     ):
         """Initialize trace context.
 
@@ -51,12 +52,23 @@ class TraceContext:
             Whether tracing is enabled for this execution (based on sampling).
         context_manager : Any | None
             The context manager object for proper cleanup.
+        langfuse_client : Any | None
+            The Langfuse client instance for intermediate flushing.
         """
         self.trace = trace
         self.session_id = session_id
         self.user_id = user_id
         self.should_trace = should_trace
         self.context_manager = context_manager
+        self.langfuse_client = langfuse_client
+
+    def flush(self) -> None:
+        """Flush the Langfuse client to send pending traces immediately."""
+        if self.langfuse_client is not None:
+            try:
+                self.langfuse_client.flush()
+            except Exception:
+                pass
 
     def create_span(
         self,

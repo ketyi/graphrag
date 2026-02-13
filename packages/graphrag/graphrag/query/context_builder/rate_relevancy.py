@@ -32,6 +32,8 @@ async def rate_relevancy(
     rate_query: str = RATE_QUERY,
     num_repeats: int = 1,
     semaphore: asyncio.Semaphore | None = None,
+    community_id: str | None = None,
+    parent_span: Any | None = None,
     **model_params: Any,
 ) -> dict[str, Any]:
     """
@@ -46,6 +48,8 @@ async def rate_relevancy(
         num_repeats: number of times to repeat the rating process for the same community (default: 1)
         model_params: additional arguments to pass to the LLM model
         semaphore: asyncio.Semaphore to limit the number of concurrent LLM calls (default: None)
+        community_id: optional community ID for Langfuse tracing
+        parent_span: optional Langfuse parent span
     """
     llm_calls, prompt_tokens, output_tokens, ratings = 0, 0, 0, []
 
@@ -55,14 +59,55 @@ async def rate_relevancy(
         .add_user_message(query)
     )
 
-    for _ in range(num_repeats):
+    # Resolve Langfuse tracing
+    model_name = getattr(model, "_model_id", None)
+
+    for repeat_idx in range(num_repeats):
+        generation = None
         async with semaphore if semaphore is not None else nullcontext():
+            # Create Langfuse generation for this LLM call
+            if parent_span is not None:
+                try:
+                    gen_name = f"rate_{community_id}" if community_id else "rate_relevancy"
+                    if num_repeats > 1:
+                        gen_name += f"_r{repeat_idx}"
+                    generation = parent_span.start_generation(
+                        name=gen_name,
+                        input={"query": query, "community_id": community_id},
+                        model=model_name,
+                        metadata={"community_id": community_id, "repeat": repeat_idx},
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Failed to create Langfuse generation for rate_relevancy: %s", e)
+
             model_response = await model.completion_async(
                 messages=messages_builder.build(),
                 response_format_json_object=True,
                 **model_params,
             )
             response = await gather_completion_response_async(model_response)
+
+        # End Langfuse generation with actual usage
+        if generation is not None:
+            try:
+                usage_dict = None
+                response_model = getattr(model_response, "model", None)
+                usage = getattr(model_response, "usage", None)
+                if usage:
+                    usage_dict = {
+                        "input": getattr(usage, "prompt_tokens", 0),
+                        "output": getattr(usage, "completion_tokens", 0),
+                        "total": getattr(usage, "total_tokens", 0),
+                    }
+                generation.update(
+                    output=response,
+                    usage_details=usage_dict,
+                    model=response_model or model_name,
+                )
+                generation.end()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Failed to end Langfuse generation for rate_relevancy: %s", e)
+
         try:
             _, parsed_response = try_parse_json_object(response)
             ratings.append(parsed_response["rating"])

@@ -138,6 +138,7 @@ def get_global_search_engine(
             "concurrent_coroutines": config.concurrent_requests,
             "threshold": gs_config.dynamic_search_threshold,
             "max_level": gs_config.dynamic_search_max_level,
+            "timeout_sec": gs_config.dynamic_search_timeout_sec,
             "model_params": {**model_params},
         })
 
@@ -159,6 +160,7 @@ def get_global_search_engine(
         map_llm_params={**model_params},
         reduce_llm_params={**model_params},
         map_max_length=gs_config.map_max_length,
+        map_timeout_sec=gs_config.map_timeout_sec,
         reduce_max_length=gs_config.reduce_max_length,
         allow_general_knowledge=False,
         json_mode=False,

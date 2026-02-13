@@ -14,6 +14,7 @@ from graphrag_llm.tokenizer import Tokenizer
 
 from graphrag.data_model.community import Community
 from graphrag.data_model.community_report import CommunityReport
+from graphrag.index.tracing import get_trace_context
 from graphrag.query.context_builder.rate_prompt import RATE_QUERY
 from graphrag.query.context_builder.rate_relevancy import rate_relevancy
 
@@ -42,6 +43,7 @@ class DynamicCommunitySelection:
         num_repeats: int = 1,
         max_level: int = 2,
         concurrent_coroutines: int = 8,
+        timeout_sec: int = 0,
         model_params: dict[str, Any] | None = None,
     ):
         self.model = model
@@ -52,6 +54,7 @@ class DynamicCommunitySelection:
         self.threshold = threshold
         self.keep_parent = keep_parent
         self.max_level = max_level
+        self.timeout_sec = timeout_sec
         self.semaphore = asyncio.Semaphore(concurrent_coroutines)
         self.model_params = model_params if model_params else {}
 
@@ -88,28 +91,96 @@ class DynamicCommunitySelection:
             "output_tokens": 0,
         }
         relevant_communities = set()
+        selection_timed_out = False
+
+        # Create Langfuse span for dynamic community selection
+        trace_ctx = get_trace_context()
+        dcs_span = None
+        if trace_ctx and trace_ctx.should_trace:
+            try:
+                dcs_span = trace_ctx.create_span(
+                    name="dynamic_community_selection",
+                    input={"query": query, "starting_communities": len(queue)},
+                    metadata={"threshold": self.threshold, "max_level": self.max_level},
+                )
+            except Exception:
+                logger.debug("Failed to create Langfuse span for dynamic community selection")
 
         while queue:
-            gather_results = await asyncio.gather(*[
-                rate_relevancy(
-                    query=query,
-                    description=(
-                        self.reports[community].summary
-                        if self.use_summary
-                        else self.reports[community].full_content
-                    ),
-                    model=self.model,
-                    tokenizer=self.tokenizer,
-                    rate_query=self.rate_query,
-                    num_repeats=self.num_repeats,
-                    semaphore=self.semaphore,
-                    **self.model_params,
+            # Create per-level span
+            level_span = None
+            if dcs_span is not None:
+                try:
+                    level_span = dcs_span.start_span(
+                        name=f"level_{level}",
+                        input={"num_communities": len(queue), "communities": queue[:20]},
+                    )
+                except Exception:
+                    logger.debug("Failed to create Langfuse span for level %d", level)
+
+            gather_tasks = [
+                asyncio.create_task(
+                    rate_relevancy(
+                        query=query,
+                        description=(
+                            self.reports[community].summary
+                            if self.use_summary
+                            else self.reports[community].full_content
+                        ),
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        rate_query=self.rate_query,
+                        num_repeats=self.num_repeats,
+                        semaphore=self.semaphore,
+                        community_id=community,
+                        parent_span=level_span,
+                        **self.model_params,
+                    )
                 )
                 for community in queue
-            ])
+            ]
+
+            # Use asyncio.wait with remaining time budget so timeout works mid-level
+            remaining_timeout = None
+            timed_out = False
+            if self.timeout_sec > 0:
+                elapsed = time() - start
+                remaining_timeout = max(0, self.timeout_sec - elapsed)
+                if remaining_timeout <= 0:
+                    # Already timed out, cancel all tasks
+                    for task in gather_tasks:
+                        task.cancel()
+                    timed_out = True
+
+            if not timed_out:
+                done, pending = await asyncio.wait(gather_tasks, timeout=remaining_timeout)
+                if pending:
+                    timed_out = True
+                    logger.warning(
+                        "Dynamic community selection timeout (%ds) during level %d: "
+                        "%d/%d communities rated, cancelling %d pending.",
+                        self.timeout_sec,
+                        level,
+                        len(done),
+                        len(gather_tasks),
+                        len(pending),
+                    )
+                    for task in pending:
+                        task.cancel()
+            else:
+                done = set()
+
+            # Collect results: match completed tasks back to their communities
+            completed_results = {}
+            for task, community in zip(gather_tasks, queue, strict=True):
+                if task in done and not task.cancelled():
+                    completed_results[community] = task.result()
 
             communities_to_rate = []
-            for community, result in zip(queue, gather_results, strict=True):
+            for community in queue:
+                if community not in completed_results:
+                    continue
+                result = completed_results[community]
                 rating = result["rating"]
                 logger.debug(
                     "dynamic community selection: community %s rating %s",
@@ -138,8 +209,30 @@ class DynamicCommunitySelection:
                     # remove parent node if the current node is deemed relevant
                     if not self.keep_parent and community in self.communities:
                         relevant_communities.discard(self.communities[community].parent)
-            queue = communities_to_rate
+
+            # End per-level span
+            if level_span is not None:
+                try:
+                    level_span.update(output={
+                        "num_relevant": sum(1 for c in queue if ratings.get(c, 0) >= self.threshold),
+                        "num_children_queued": len(communities_to_rate),
+                    })
+                    level_span.end()
+                except Exception:
+                    logger.debug("Failed to end Langfuse span for level %d", level)
+
+            # Flush Langfuse after each level for real-time visibility
+            if trace_ctx and trace_ctx.should_trace:
+                trace_ctx.flush()
+
+            # If timed out mid-level, stop traversal with partial results
+            if timed_out:
+                selection_timed_out = True
+                queue = []
+            else:
+                queue = communities_to_rate
             level += 1
+
             if (
                 (len(queue) == 0)
                 and (len(relevant_communities) == 0)
@@ -158,6 +251,23 @@ class DynamicCommunitySelection:
             self.reports[community] for community in relevant_communities
         ]
         end = time()
+
+        # End dynamic community selection span
+        if dcs_span is not None:
+            try:
+                dcs_span.update(output={
+                    "duration_s": int(end - start),
+                    "num_relevant": len(relevant_communities),
+                    "total_communities": len(self.reports),
+                    "timed_out": selection_timed_out,
+                    "rating_distribution": dict(sorted(Counter(ratings.values()).items())),
+                    "llm_calls": llm_info["llm_calls"],
+                    "prompt_tokens": llm_info["prompt_tokens"],
+                    "output_tokens": llm_info["output_tokens"],
+                })
+                dcs_span.end()
+            except Exception:
+                logger.debug("Failed to end Langfuse span for dynamic community selection")
 
         logger.debug(
             "dynamic community selection (took: %ss)\n"

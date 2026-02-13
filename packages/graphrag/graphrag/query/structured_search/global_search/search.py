@@ -33,6 +33,7 @@ from graphrag.query.context_builder.builders import GlobalContextBuilder
 from graphrag.query.context_builder.conversation_history import (
     ConversationHistory,
 )
+from graphrag.index.tracing import get_trace_context
 from graphrag.query.llm.text_utils import try_parse_json_object
 from graphrag.query.structured_search.base import BaseSearch, SearchResult
 
@@ -72,6 +73,7 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
         reduce_llm_params: dict[str, Any] | None = None,
         map_max_length: int = 1000,
         reduce_max_length: int = 2000,
+        map_timeout_sec: int = 180,
         context_builder_params: dict[str, Any] | None = None,
         concurrent_coroutines: int = 32,
     ):
@@ -100,6 +102,7 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
             self.map_llm_params.pop("response_format", None)
         self.map_max_length = map_max_length
         self.reduce_max_length = reduce_max_length
+        self.map_timeout_sec = map_timeout_sec
 
         self.semaphore = asyncio.Semaphore(concurrent_coroutines)
 
@@ -109,6 +112,8 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
         conversation_history: ConversationHistory | None = None,
     ) -> AsyncGenerator[str, None]:
         """Stream the global search response."""
+        trace_ctx = get_trace_context()
+
         context_result = await self.context_builder.build_context(
             query=query,
             conversation_history=conversation_history,
@@ -117,27 +122,83 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
         for callback in self.callbacks:
             callback.on_map_response_start(context_result.context_chunks)  # type: ignore
 
-        map_responses = await asyncio.gather(*[
-            self._map_response_single_batch(
-                context_data=data,
-                query=query,
-                max_length=self.map_max_length,
-                **self.map_llm_params,
+        # Create map phase span
+        map_span = None
+        if trace_ctx and trace_ctx.should_trace:
+            map_span = trace_ctx.create_span(
+                name="map_phase",
+                input={"query": query, "num_batches": len(context_result.context_chunks)},
             )
-            for data in context_result.context_chunks
-        ])
+
+        map_tasks = [
+            asyncio.create_task(
+                self._map_response_single_batch(
+                    context_data=data,
+                    query=query,
+                    max_length=self.map_max_length,
+                    batch_index=i,
+                    parent_span=map_span,
+                    **self.map_llm_params,
+                )
+            )
+            for i, data in enumerate(context_result.context_chunks)
+        ]
+
+        if map_tasks:
+            timeout = self.map_timeout_sec if self.map_timeout_sec > 0 else None
+            done, pending = await asyncio.wait(map_tasks, timeout=timeout)
+            map_timed_out = bool(pending)
+            if pending:
+                logger.warning(
+                    "Map phase timeout (%ds): %d/%d batches completed, cancelling %d pending.",
+                    self.map_timeout_sec,
+                    len(done),
+                    len(map_tasks),
+                    len(pending),
+                )
+                for task in pending:
+                    task.cancel()
+            map_responses = [task.result() for task in done if not task.cancelled()]
+        else:
+            map_responses = []
+            map_timed_out = False
+            logger.warning("Map phase skipped: no community reports from context builder.")
+
+        if map_span is not None:
+            map_span.update(output={
+                "num_responses": len(map_responses),
+                "timed_out": map_timed_out,
+                "skipped": not map_tasks,
+            })
+            map_span.end()
+
+        # Flush after map phase for real-time trace visibility
+        if trace_ctx and trace_ctx.should_trace:
+            trace_ctx.flush()
 
         for callback in self.callbacks:
             callback.on_map_response_end(map_responses)  # type: ignore
             callback.on_context(context_result.context_records)
+
+        # Create reduce phase span
+        reduce_span = None
+        if trace_ctx and trace_ctx.should_trace:
+            reduce_span = trace_ctx.create_span(
+                name="reduce_phase",
+                input={"query": query},
+            )
 
         async for response in self._stream_reduce_response(
             map_responses=map_responses,  # type: ignore
             query=query,
             max_length=self.reduce_max_length,
             model_parameters=self.reduce_llm_params,
+            parent_span=reduce_span,
         ):
             yield response
+
+        if reduce_span is not None:
+            reduce_span.end()
 
     async def search(
         self,
@@ -169,15 +230,60 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
         for callback in self.callbacks:
             callback.on_map_response_start(context_result.context_chunks)  # type: ignore
 
-        map_responses = await asyncio.gather(*[
-            self._map_response_single_batch(
-                context_data=data,
-                query=query,
-                max_length=self.map_max_length,
-                **self.map_llm_params,
+        # Create map phase span
+        trace_ctx = get_trace_context()
+        map_span = None
+        if trace_ctx and trace_ctx.should_trace:
+            map_span = trace_ctx.create_span(
+                name="map_phase",
+                input={"query": query, "num_batches": len(context_result.context_chunks)},
             )
-            for data in context_result.context_chunks
-        ])
+
+        map_tasks = [
+            asyncio.create_task(
+                self._map_response_single_batch(
+                    context_data=data,
+                    query=query,
+                    max_length=self.map_max_length,
+                    batch_index=i,
+                    parent_span=map_span,
+                    **self.map_llm_params,
+                )
+            )
+            for i, data in enumerate(context_result.context_chunks)
+        ]
+
+        if map_tasks:
+            timeout = self.map_timeout_sec if self.map_timeout_sec > 0 else None
+            done, pending = await asyncio.wait(map_tasks, timeout=timeout)
+            map_timed_out = bool(pending)
+            if pending:
+                logger.warning(
+                    "Map phase timeout (%ds): %d/%d batches completed, cancelling %d pending.",
+                    self.map_timeout_sec,
+                    len(done),
+                    len(map_tasks),
+                    len(pending),
+                )
+                for task in pending:
+                    task.cancel()
+            map_responses = [task.result() for task in done if not task.cancelled()]
+        else:
+            map_responses = []
+            map_timed_out = False
+            logger.warning("Map phase skipped: no community reports from context builder.")
+
+        if map_span is not None:
+            map_span.update(output={
+                "num_responses": len(map_responses),
+                "timed_out": map_timed_out,
+                "skipped": not map_tasks,
+            })
+            map_span.end()
+
+        # Flush after map phase for real-time trace visibility
+        if trace_ctx and trace_ctx.should_trace:
+            trace_ctx.flush()
 
         for callback in self.callbacks:
             callback.on_map_response_end(map_responses)
@@ -188,11 +294,24 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
         output_tokens["map"] = sum(response.output_tokens for response in map_responses)
 
         # Step 2: Combine the intermediate answers from step 2 to generate the final answer
+        # Create reduce phase span
+        reduce_span = None
+        if trace_ctx and trace_ctx.should_trace:
+            reduce_span = trace_ctx.create_span(
+                name="reduce_phase",
+                input={"query": query},
+            )
+
         reduce_response = await self._reduce_response(
             map_responses=map_responses,
             query=query,
+            parent_span=reduce_span,
             **self.reduce_llm_params,
         )
+
+        if reduce_span is not None:
+            reduce_span.update(output={"response_length": len(str(reduce_response.response))})
+            reduce_span.end()
         llm_calls["reduce"] = reduce_response.llm_calls
         prompt_tokens["reduce"] = reduce_response.prompt_tokens
         output_tokens["reduce"] = reduce_response.output_tokens
@@ -218,11 +337,14 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
         context_data: str,
         query: str,
         max_length: int,
+        batch_index: int = 0,
+        parent_span: Any | None = None,
         **llm_kwargs,
     ) -> SearchResult:
         """Generate answer for a single chunk of community reports."""
         start_time = time.time()
         search_prompt = ""
+        generation = None
         try:
             search_prompt = self.map_system_prompt.format(
                 context_data=context_data, max_length=max_length
@@ -234,6 +356,19 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
                 .add_user_message(query)
             )
 
+            # Create Langfuse generation span for this map LLM call
+            model_name = getattr(self.model, "_model_id", None)
+            if parent_span is not None:
+                try:
+                    generation = parent_span.start_generation(
+                        name=f"map_batch_{batch_index}",
+                        input={"system_prompt": search_prompt, "query": query},
+                        model=model_name,
+                        metadata={"batch_index": batch_index},
+                    )
+                except Exception:
+                    logger.debug("Failed to create Langfuse generation for map batch %d", batch_index)
+
             async with self.semaphore:
                 model_response = await self.model.completion_async(
                     messages=messages_builder.build(),
@@ -242,6 +377,30 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
                 )
                 search_response = await gather_completion_response_async(model_response)
                 logger.debug("Map response: %s", search_response)
+
+            # End Langfuse generation with output and actual usage from LLM response
+            if generation is not None:
+                try:
+                    # Extract actual usage from the LLM response object
+                    usage_dict = None
+                    response_model = None
+                    usage = getattr(model_response, "usage", None)
+                    if usage:
+                        usage_dict = {
+                            "input": getattr(usage, "prompt_tokens", 0),
+                            "output": getattr(usage, "completion_tokens", 0),
+                            "total": getattr(usage, "total_tokens", 0),
+                        }
+                    response_model = getattr(model_response, "model", None)
+                    generation.update(
+                        output=search_response,
+                        usage_details=usage_dict,
+                        model=response_model or model_name,
+                    )
+                    generation.end()
+                except Exception:
+                    logger.debug("Failed to end Langfuse generation for map batch %d", batch_index)
+
             try:
                 # parse search response json
                 processed_response = self._parse_search_response(search_response)
@@ -263,6 +422,12 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
 
         except Exception:
             logger.exception("Exception in _map_response_single_batch")
+            if generation is not None:
+                try:
+                    generation.update(output={"error": "exception in map batch"})
+                    generation.end()
+                except Exception:
+                    pass
             return SearchResult(
                 response=[{"answer": "", "score": 0}],
                 context_data=context_data,
@@ -307,12 +472,14 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
         self,
         map_responses: list[SearchResult],
         query: str,
+        parent_span: Any | None = None,
         **llm_kwargs,
     ) -> SearchResult:
         """Combine all intermediate responses from single batches into a final answer to the user query."""
         text_data = ""
         search_prompt = ""
         start_time = time.time()
+        generation = None
         try:
             # collect all key points into a single list to prepare for sorting
             key_points = []
@@ -340,8 +507,14 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
             if len(filtered_key_points) == 0 and not self.allow_general_knowledge:
                 # return no data answer if no key points are found
                 logger.warning(
-                    "Warning: All map responses have score 0 (i.e., no relevant information found from the dataset), returning a canned 'I do not know' answer. You can try enabling `allow_general_knowledge` to encourage the LLM to incorporate relevant general knowledge, at the risk of increasing hallucinations."
+                    "Reduce phase skipped: all map responses have score 0 (no relevant information found from the dataset), returning a canned 'I do not know' answer. You can try enabling `allow_general_knowledge` to encourage the LLM to incorporate relevant general knowledge, at the risk of increasing hallucinations."
                 )
+                if parent_span is not None:
+                    parent_span.update(output={
+                        "skipped": True,
+                        "reason": "all_scores_zero",
+                        "num_key_points": len(key_points),
+                    })
                 return SearchResult(
                     response=NO_DATA_ANSWER,
                     context_data="",
@@ -393,7 +566,21 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
                 .add_user_message(query)
             )
 
+            # Create Langfuse generation span for reduce LLM call
+            model_name = getattr(self.model, "_model_id", None)
+            if parent_span is not None:
+                try:
+                    generation = parent_span.start_generation(
+                        name="reduce",
+                        input={"system_prompt": search_prompt, "query": query},
+                        model=model_name,
+                    )
+                except Exception:
+                    logger.debug("Failed to create Langfuse generation for reduce")
+
             search_response = ""
+            response_model = model_name
+            last_usage = None
 
             response_search: AsyncIterator[
                 LLMCompletionChunk
@@ -408,6 +595,36 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
                 search_response += response_text
                 for callback in self.callbacks:
                     callback.on_llm_new_token(response_text)
+                # Capture model name and usage from chunks
+                if not response_model and hasattr(chunk, "model"):
+                    response_model = chunk.model
+                if hasattr(chunk, "usage") and chunk.usage is not None:
+                    last_usage = chunk.usage
+
+            # End Langfuse generation with output and actual usage
+            if generation is not None:
+                try:
+                    usage_dict = None
+                    if last_usage:
+                        usage_dict = {
+                            "input": getattr(last_usage, "prompt_tokens", 0),
+                            "output": getattr(last_usage, "completion_tokens", 0),
+                            "total": getattr(last_usage, "total_tokens", 0),
+                        }
+                    else:
+                        # Fallback to tokenizer estimates if no usage from API
+                        usage_dict = {
+                            "input": len(self.tokenizer.encode(search_prompt)),
+                            "output": len(self.tokenizer.encode(search_response)),
+                        }
+                    generation.update(
+                        output=search_response,
+                        usage_details=usage_dict,
+                        model=response_model or model_name,
+                    )
+                    generation.end()
+                except Exception:
+                    logger.debug("Failed to end Langfuse generation for reduce")
 
             return SearchResult(
                 response=search_response,
@@ -420,6 +637,12 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
             )
         except Exception:
             logger.exception("Exception in reduce_response")
+            if generation is not None:
+                try:
+                    generation.update(output={"error": "exception in reduce"})
+                    generation.end()
+                except Exception:
+                    pass
             return SearchResult(
                 response="",
                 context_data=text_data,
@@ -435,6 +658,7 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
         map_responses: list[SearchResult],
         query: str,
         max_length: int,
+        parent_span: Any | None = None,
         **llm_kwargs,
     ) -> AsyncGenerator[str, None]:
         # collect all key points into a single list to prepare for sorting
@@ -463,8 +687,14 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
         if len(filtered_key_points) == 0 and not self.allow_general_knowledge:
             # return no data answer if no key points are found
             logger.warning(
-                "Warning: All map responses have score 0 (i.e., no relevant information found from the dataset), returning a canned 'I do not know' answer. You can try enabling `allow_general_knowledge` to encourage the LLM to incorporate relevant general knowledge, at the risk of increasing hallucinations."
+                "Reduce phase skipped: all map responses have score 0 (no relevant information found from the dataset), returning a canned 'I do not know' answer. You can try enabling `allow_general_knowledge` to encourage the LLM to incorporate relevant general knowledge, at the risk of increasing hallucinations."
             )
+            if parent_span is not None:
+                parent_span.update(output={
+                    "skipped": True,
+                    "reason": "all_scores_zero",
+                    "num_key_points": len(key_points),
+                })
             yield NO_DATA_ANSWER
             return
 
@@ -506,6 +736,19 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
             .add_user_message(query)
         )
 
+        # Create Langfuse generation span for streaming reduce LLM call
+        generation = None
+        model_name = getattr(self.model, "_model_id", None)
+        if parent_span is not None:
+            try:
+                generation = parent_span.start_generation(
+                    name="reduce_stream",
+                    input={"system_prompt": search_prompt, "query": query},
+                    model=model_name,
+                )
+            except Exception:
+                logger.debug("Failed to create Langfuse generation for streaming reduce")
+
         response_search: AsyncIterator[
             LLMCompletionChunk
         ] = await self.model.completion_async(
@@ -514,8 +757,42 @@ class GlobalSearch(BaseSearch[GlobalContextBuilder]):
             **llm_kwargs.get("model_parameters", {}),
         )  # type: ignore
 
+        full_response = ""
+        response_model = model_name
+        last_usage = None
         async for chunk in response_search:
             response_text = chunk.choices[0].delta.content or ""
+            full_response += response_text
             for callback in self.callbacks:
                 callback.on_llm_new_token(response_text)
             yield response_text
+            # Capture model name and usage from chunks
+            if not response_model and hasattr(chunk, "model"):
+                response_model = chunk.model
+            if hasattr(chunk, "usage") and chunk.usage is not None:
+                last_usage = chunk.usage
+
+        # End Langfuse generation with accumulated output and actual usage
+        if generation is not None:
+            try:
+                usage_dict = None
+                if last_usage:
+                    usage_dict = {
+                        "input": getattr(last_usage, "prompt_tokens", 0),
+                        "output": getattr(last_usage, "completion_tokens", 0),
+                        "total": getattr(last_usage, "total_tokens", 0),
+                    }
+                else:
+                    # Fallback to tokenizer estimates if no usage from API
+                    usage_dict = {
+                        "input": len(self.tokenizer.encode(search_prompt)),
+                        "output": len(self.tokenizer.encode(full_response)),
+                    }
+                generation.update(
+                    output=full_response,
+                    usage_details=usage_dict,
+                    model=response_model or model_name,
+                )
+                generation.end()
+            except Exception:
+                logger.debug("Failed to end Langfuse generation for streaming reduce")

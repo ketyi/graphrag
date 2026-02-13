@@ -4,6 +4,7 @@
 """CLI implementation of the query subcommand."""
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -31,11 +32,20 @@ def run_global_search(
     streaming: bool,
     query: str,
     verbose: bool,
+    session_id: str | None = None,
+    user_id: str | None = None,
 ):
     """Perform a global search with a given query.
 
     Loads index files required for global search and calls the Query API.
     """
+    # Default user_id to OS username if not provided (consistent with indexing/prompt_tune)
+    if user_id is None:
+        user_id = os.getenv("USER") or os.getenv("USERNAME") or "unknown"
+    # Default session_id for grouping queries in Langfuse
+    if session_id is None:
+        session_id = "global_query"
+
     cli_overrides: dict[str, Any] = {}
     if data_dir:
         cli_overrides["output_storage"] = {"base_dir": str(data_dir)}
@@ -82,6 +92,8 @@ def run_global_search(
                 query=query,
                 callbacks=[callbacks],
                 verbose=verbose,
+                session_id=session_id,
+                user_id=user_id,
             ):
                 full_response += stream_chunk
                 print(stream_chunk, end="")
@@ -102,6 +114,8 @@ def run_global_search(
             response_type=response_type,
             query=query,
             verbose=verbose,
+            session_id=session_id,
+            user_id=user_id,
         )
     )
     print(response)

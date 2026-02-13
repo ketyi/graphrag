@@ -206,6 +206,8 @@ class GlobalSearchDefaults:
     dynamic_search_num_repeats: int = 1
     dynamic_search_use_summary: bool = False
     dynamic_search_max_level: int = 2
+    dynamic_search_timeout_sec: int = 180
+    map_timeout_sec: int = 180
     completion_model_id: str = DEFAULT_COMPLETION_MODEL_ID
 
 

@@ -427,6 +427,16 @@ def _query_cli(
         "--streaming/--no-streaming",
         help="Print the response in a streaming manner.",
     ),
+    session_id: str | None = typer.Option(
+        None,
+        "--session-id",
+        help="Optional session ID for Langfuse tracing.",
+    ),
+    user_id: str | None = typer.Option(
+        None,
+        "--user-id",
+        help="Optional user ID for Langfuse tracing.",
+    ),
 ) -> None:
     """Query a knowledge graph index."""
     from graphrag.cli.query import (
@@ -457,6 +467,8 @@ def _query_cli(
                 streaming=streaming,
                 query=query,
                 verbose=verbose,
+                session_id=session_id,
+                user_id=user_id,
             )
         case SearchMethod.DRIFT:
             run_drift_search(
